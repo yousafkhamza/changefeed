@@ -133,7 +133,26 @@ dialog::backdrop { background: rgba(10, 16, 24, .5); }
 .foot { display: flex; justify-content: space-between; padding-block: 8px 28px; color: var(--muted); font-size: .8rem; }
 .foot a { color: var(--muted); }
 
+.who { font-size: .82rem; color: var(--muted); display: inline-flex; gap: 10px; align-items: center; }
+.who a { color: var(--accent); }
+.sso-btn { display: block; text-align: center; background: var(--accent); color: var(--accent-ink); border-radius: 8px; padding: 9px 14px; font-weight: 600; text-decoration: none; }
+.or { text-align: center; font-size: .8rem !important; }
+.lower { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 18px; margin-bottom: 24px; }
+.card h2 { font-size: 1rem; margin: 0; }
+.inc { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; gap: 10px; align-items: baseline; width: 100%; text-align: left; background: none; border: 0; border-radius: 8px; padding: 9px 12px; font: inherit; font-weight: 400; color: inherit; }
+.inc:hover { background: var(--sunken); }
+.badge { font: 600 .68rem var(--mono); text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+.badge.open { color: var(--incident); border-color: var(--incident); }
+.badge.freeze { color: var(--k-config); border-color: var(--k-config); }
+.table-wrap { overflow-x: auto; }
+table.dora { width: 100%; border-collapse: collapse; font-size: .85rem; font-variant-numeric: tabular-nums; }
+table.dora th, table.dora td { padding: 8px 12px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.dora th:first-child, table.dora td:first-child { text-align: left; }
+table.dora th { font: 600 .72rem var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.cfr-bar { display: inline-block; width: 56px; height: 6px; border-radius: 3px; background: var(--line); vertical-align: middle; margin-left: 8px; overflow: hidden; }
+.cfr-bar i { display: block; height: 100%; background: var(--incident); }
 @media (max-width: 860px) {
+  .lower { grid-template-columns: 1fr; }
   .panes { grid-template-columns: 1fr; }
   .pane + .pane { border-left: 0; border-top: 1px solid var(--line); }
   .filters { margin-left: 0; }

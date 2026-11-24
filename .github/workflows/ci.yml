@@ -18,6 +18,20 @@ jobs:
     name: go (test, lint, vuln)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: changefeed
+          POSTGRES_PASSWORD: changefeed
+          POSTGRES_DB: changefeed
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U changefeed"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # store tests run against SQLite and this Postgres
+      CHANGEFEED_TEST_POSTGRES: postgres://changefeed:changefeed@localhost:5432/changefeed?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,6 +89,10 @@ jobs:
               rendered.yaml
           done
       - name: rendered config is accepted by the server
+        env:
+          # dummy secrets: full-values.yaml turns on SSO and Slack
+          CHANGEFEED_SESSION_KEY: ci-only-session-key-0123456789abcdef
+          CHANGEFEED_SLACK_BOT_TOKEN: xoxb-ci-only
         run: |
           for v in charts/changefeed/values.yaml test/chart/full-values.yaml; do
             helm template cf charts/changefeed -f "$v" --show-only templates/configmap.yaml \
@@ -143,6 +161,12 @@ jobs:
           docker run -d --name cf -p 8080:8080 changefeed:e2e serve --demo --log-format text
           for _ in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
           curl -sf 'localhost:8080/api/v1/suspects?service=checkout-api&window=60m&at=8m' | tee suspects.json | jq -e '.suspects[0].changeset == "gh:shop/checkout#412"'
+          curl -sf 'localhost:8080/api/v1/incidents' | jq -e '.incidents[0].topChangeset == "gh:shop/checkout#412"'
+          curl -sf 'localhost:8080/api/v1/dora?env=prod' | jq -e '[.services[] | select(.service == "checkout-api")][0].failedDeployments == 1'
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"suspects","arguments":{"service":"checkout-api","at":"8m"}}}' \
+            | docker run --rm -i --network host changefeed:e2e mcp --endpoint http://localhost:8080 | tail -1 \
+            | jq -e '.result.content[0].text | contains("PR #412")'
           docker rm -f cf
       - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:

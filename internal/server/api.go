@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yousafkhamza/changefeed/internal/auth"
 	"github.com/yousafkhamza/changefeed/internal/event"
 	"github.com/yousafkhamza/changefeed/internal/hooks"
 	"github.com/yousafkhamza/changefeed/internal/rank"
@@ -93,24 +95,49 @@ func publicError(err error) string {
 	return "internal error storing event"
 }
 
+// scope narrows a filter to what the principal may read. It returns false
+// when the request asks only for things the principal cannot see.
+func scope(p auth.Principal, f *store.Filter) bool {
+	if len(p.Envs) > 0 {
+		if f.Env != "" && !p.SeesEnv(f.Env) {
+			return false
+		}
+		f.Envs = p.Envs
+	}
+	if len(p.Services) > 0 {
+		if len(f.Services) == 0 {
+			f.Services = p.Services
+		} else {
+			f.Services = slices.DeleteFunc(slices.Clone(f.Services), func(s string) bool { return !p.SeesService(s) })
+			if len(f.Services) == 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 	f, err := s.filterFrom(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	evs, err := s.store.List(r.Context(), f)
-	if err != nil {
-		s.log.Error("list events", "err", err)
-		writeError(w, http.StatusInternalServerError, "could not list events")
-		return
+	evs := []event.Event{}
+	if scope(principal(r), &f) {
+		if evs, err = s.store.List(r.Context(), f); err != nil {
+			s.log.Error("list events", "err", err)
+			writeError(w, http.StatusInternalServerError, "could not list events")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": evs, "since": f.Since, "until": f.Until})
 }
 
 func (s *Server) getEvent(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
 	e, err := s.store.Get(r.Context(), r.PathValue("id"))
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || (err == nil && !p.Sees(e.Env, e.Service)) {
 		writeError(w, http.StatusNotFound, "event not found")
 		return
 	}
@@ -120,9 +147,29 @@ func (s *Server) getEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	related := []event.Event{}
 	if e.ChangeSet != "" {
-		related, _ = s.store.List(r.Context(), store.Filter{ChangeSet: e.ChangeSet, Limit: 100})
+		all, _ := s.store.List(r.Context(), store.Filter{ChangeSet: e.ChangeSet, Limit: 100})
+		for _, x := range all {
+			if p.Sees(x.Env, x.Service) {
+				related = append(related, x)
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"event": e, "changeset": related, "cloudevent": e.ToCloudEvent()})
+}
+
+// rankFor scores changes before an incident. Events the caller cannot see
+// are left out.
+func (s *Server) rankFor(r *http.Request, p auth.Principal, service, env string, at time.Time, window time.Duration) ([]rank.Suspect, rank.Graph, error) {
+	f := store.Filter{Env: env, Since: at.Add(-window), Until: at, Limit: 5000}
+	g := rank.Graph{Deps: map[string][]string{service: s.cfg.Dependencies(service)}, Platform: s.cfg.PlatformServices}
+	if !scope(p, &f) {
+		return []rank.Suspect{}, g, nil
+	}
+	evs, err := s.store.List(r.Context(), f)
+	if err != nil {
+		return nil, g, err
+	}
+	return rank.Rank(rank.Incident{Service: service, Env: env, At: at, Window: window}, g, evs), g, nil
 }
 
 func (s *Server) suspects(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +182,11 @@ func (s *Server) suspects(w http.ResponseWriter, r *http.Request) {
 	env := strings.ToLower(q.Get("env"))
 	if env == "" {
 		env = "prod"
+	}
+	p := principal(r)
+	if !p.Sees(env, service) {
+		writeError(w, http.StatusForbidden, "your team cannot see "+service+" in "+env)
+		return
 	}
 	at := s.now().UTC()
 	if v := q.Get("at"); v != "" {
@@ -154,17 +206,15 @@ func (s *Server) suspects(w http.ResponseWriter, r *http.Request) {
 		}
 		window = d
 	}
-	evs, err := s.store.List(r.Context(), store.Filter{Env: env, Since: at.Add(-window), Until: at, Limit: 5000})
+	sus, g, err := s.rankFor(r, p, service, env, at, window)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list events")
 		return
 	}
-	inc := rank.Incident{Service: service, Env: env, At: at, Window: window}
-	g := rank.Graph{Deps: map[string][]string{service: s.cfg.Dependencies(service)}, Platform: s.cfg.PlatformServices}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"incident": map[string]any{"service": service, "env": env, "at": at, "window": window.String(),
 			"dependsOn": g.Deps[service], "platform": g.Platform},
-		"suspects": rank.Rank(inc, g, evs),
+		"suspects": sus,
 	})
 }
 
@@ -174,6 +224,9 @@ func (s *Server) meta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read metadata")
 		return
 	}
+	p := principal(r)
+	m.Envs = slices.DeleteFunc(m.Envs, func(e string) bool { return !p.SeesEnv(e) })
+	m.Services = slices.DeleteFunc(m.Services, func(sv string) bool { return !p.SeesService(sv) })
 	writeJSON(w, http.StatusOK, map[string]any{"envs": m.Envs, "services": m.Services, "sources": m.Sources,
 		"kinds": event.Kinds, "dependencies": s.cfg.Services, "platform": s.cfg.PlatformServices})
 }
@@ -197,11 +250,6 @@ func (s *Server) grafana(w http.ResponseWriter, r *http.Request) {
 			*dst = time.UnixMilli(ms)
 		}
 	}
-	evs, err := s.store.List(r.Context(), f)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not list events")
-		return
-	}
 	type annotation struct {
 		Time    int64    `json:"time"`
 		TimeEnd int64    `json:"timeEnd"`
@@ -209,7 +257,16 @@ func (s *Server) grafana(w http.ResponseWriter, r *http.Request) {
 		Text    string   `json:"text"`
 		Tags    []string `json:"tags"`
 	}
-	out := make([]annotation, 0, len(evs))
+	out := []annotation{}
+	if !scope(principal(r), &f) {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	evs, err := s.store.List(r.Context(), f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not list events")
+		return
+	}
 	for _, e := range evs {
 		ms := e.Time.UnixMilli()
 		out = append(out, annotation{
@@ -222,25 +279,50 @@ func (s *Server) grafana(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) hookArgoCD(w http.ResponseWriter, r *http.Request) {
-	s.hook(w, r, "argocd", func(raw []byte) (event.Event, error) { return hooks.ArgoCD(raw, s.cfg.Hooks.ArgoCD.DefaultEnv) })
+	raw, ok := s.hookBody(w, r, "argocd")
+	if !ok {
+		return
+	}
+	s.ingestMapped(w, r, "argocd", func() (event.Event, error) { return hooks.ArgoCD(raw, s.cfg.Hooks.ArgoCD.DefaultEnv) })
 }
 
 func (s *Server) hookAWS(w http.ResponseWriter, r *http.Request) {
-	s.hook(w, r, "aws", func(raw []byte) (event.Event, error) {
+	raw, ok := s.hookBody(w, r, "aws")
+	if !ok {
+		return
+	}
+	s.ingestMapped(w, r, "aws", func() (event.Event, error) {
 		return hooks.AWS(raw, s.cfg.Hooks.AWS.Accounts, s.cfg.Hooks.AWS.DefaultEnv)
 	})
 }
 
-func (s *Server) hook(w http.ResponseWriter, r *http.Request, lane string, mapFn func([]byte) (event.Event, error)) {
-	if !principal(r).CanWriteSource(lane) {
-		writeError(w, http.StatusForbidden, "credentials may not write source "+lane)
-		return
-	}
-	raw, ok := readBody(w, r)
+func (s *Server) hookUnleash(w http.ResponseWriter, r *http.Request) {
+	raw, ok := s.hookBody(w, r, "flags")
 	if !ok {
 		return
 	}
-	e, err := mapFn(raw)
+	s.ingestMapped(w, r, "flags", func() (event.Event, error) { return hooks.Unleash(raw, s.cfg.Hooks.Flags) })
+}
+
+func (s *Server) hookLaunchDarkly(w http.ResponseWriter, r *http.Request, raw []byte) {
+	s.ingestMapped(w, r, "flags", func() (event.Event, error) { return hooks.LaunchDarkly(raw, s.cfg.Hooks.Flags) })
+}
+
+func (s *Server) hookFlagsmith(w http.ResponseWriter, r *http.Request, raw []byte) {
+	s.ingestMapped(w, r, "flags", func() (event.Event, error) { return hooks.Flagsmith(raw, s.cfg.Hooks.Flags) })
+}
+
+// hookBody checks the caller may write this lane and reads the body.
+func (s *Server) hookBody(w http.ResponseWriter, r *http.Request, lane string) ([]byte, bool) {
+	if !principal(r).CanWriteSource(lane) {
+		writeError(w, http.StatusForbidden, "credentials may not write source "+lane)
+		return nil, false
+	}
+	return readBody(w, r)
+}
+
+func (s *Server) ingestMapped(w http.ResponseWriter, r *http.Request, lane string, mapFn func() (event.Event, error)) {
+	e, err := mapFn()
 	if errors.Is(err, hooks.ErrIgnored) {
 		s.metrics.ignored.WithLabelValues(lane).Inc()
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
@@ -261,6 +343,10 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request, lane string, mapFn
 		status = "duplicate"
 	}
 	writeJSON(w, http.StatusAccepted, ingestResult{ID: e.ID, Status: status, ChangeSet: e.ChangeSet})
+}
+
+func verifySignature(secret string, body []byte, sig string) bool {
+	return hooks.VerifyHMAC(secret, body, sig)
 }
 
 // filterFrom reads the common list filters from the query string.

@@ -31,7 +31,7 @@ RANK  SCORE  WHEN   CHANGE                                                      
 **Try it in 10 seconds** (sample incident, no setup):
 
 ```sh
-docker run --rm -p 8080:8080 ghcr.io/yousafkhamza/changefeed:v0.1.0 serve --demo
+docker run --rm -p 8080:8080 ghcr.io/yousafkhamza/changefeed:v0.3.0 serve --demo
 # open http://localhost:8080 and pick checkout-api
 ```
 
@@ -41,6 +41,11 @@ docker run --rm -p 8080:8080 ghcr.io/yousafkhamza/changefeed:v0.1.0 serve --demo
 - [Install on Kubernetes](#install-on-kubernetes)
 - [Connect your sources](#connect-your-sources): GitHub Actions, Argo CD, AWS CloudTrail, Terraform, anything else
 - [Read it](#read-it): web UI, CLI, Grafana, API, Prometheus
+- [Incidents, Slack and AI assistants](#incidents-slack-and-ai-assistants): Alertmanager, Slack, MCP
+- [Change freezes](#change-freezes)
+- [Delivery metrics (DORA)](#delivery-metrics-dora)
+- [Single sign-on and teams](#single-sign-on-and-teams)
+- [Postgres and high availability](#postgres-and-high-availability)
 - [How ranking works](#how-ranking-works)
 - [Security](#security)
 - [Configuration reference](#configuration-reference)
@@ -51,13 +56,13 @@ docker run --rm -p 8080:8080 ghcr.io/yousafkhamza/changefeed:v0.1.0 serve --demo
 
 ```
  GitHub Actions ──OIDC──┐
- Argo CD ──webhook──────┤        ┌──────────── changefeed ────────────┐
- AWS CloudTrail ──EB────┼──────▶ │ normalize → redact → correlate →   │──▶ UI · CLI · Grafana
- Terraform / planlens ──┤        │ store (SQLite) → rank              │    REST API · Prometheus
- any tool ──CLI/HTTP────┘        └─────────────▲──────────────────────┘
-                                               │ watch (read-only)
-                                    Kubernetes: Deployments, StatefulSets,
-                                    DaemonSets, ConfigMaps, Helm releases
+ Argo CD ──webhook──────┤        ┌──────────── changefeed ─────────────┐
+ AWS CloudTrail ──EB────┤        │ normalize → redact → correlate →    │──▶ UI (SSO) · CLI · Grafana
+ Terraform / planlens ──┼──────▶ │ store (SQLite or Postgres) → rank   │    REST API · Prometheus
+ LaunchDarkly/Unleash/  │        │                                     │    MCP (AI assistants)
+   Flagsmith ───────────┤        └──────▲───────────────▲──────────────┘
+ any tool ──CLI/HTTP────┘               │ watch          │ alerts
+                             Kubernetes (read-only)   Alertmanager ──▶ incident ──▶ Slack
 ```
 
 1. **Collect.** Kubernetes is watched from inside the cluster with get/list/watch only. Everything else pushes events to changefeed.
@@ -117,7 +122,7 @@ jobs:
       contents: read
     steps:
       # ... your deploy ...
-      - uses: yousafkhamza/changefeed@v0.1.0
+      - uses: yousafkhamza/changefeed@v0.3.0
         with:
           endpoint: https://changefeed.example.com
           service: checkout-api
@@ -148,7 +153,7 @@ Each sync carries its Git revision, so it joins the PR's change set automaticall
 
 ```hcl
 module "changefeed_cloudtrail" {
-  source   = "github.com/yousafkhamza/changefeed//deploy/terraform/aws-cloudtrail?ref=v0.1.0"
+  source   = "github.com/yousafkhamza/changefeed//deploy/terraform/aws-cloudtrail?ref=v0.3.0"
   endpoint = "https://changefeed.example.com"
   token    = var.changefeed_aws_token   # scopes [write], sources [aws]
   services = ["rds", "iam", "ec2", "eks", "elasticloadbalancing"]
@@ -173,7 +178,27 @@ changefeed emit --service platform --env prod --from-plan plan.json
 
 If you pass a [planlens](https://github.com/yousafkhamza/planlens) JSON report instead, changefeed copies its risk level, score and findings.
 
-### Feature flags, runbooks, anything else
+### Feature flags
+
+| Provider | Webhook URL | Authentication |
+|---|---|---|
+| LaunchDarkly | `/hooks/launchdarkly` | Webhook signing secret → `CHANGEFEED_LAUNCHDARKLY_SECRET` (checks `X-LD-Signature`) |
+| Flagsmith | `/hooks/flagsmith` | Webhook secret → `CHANGEFEED_FLAGSMITH_SECRET` (checks `X-Flagsmith-Signature`) |
+| Unleash | `/hooks/unleash` | Webhook addon with header `Authorization: Bearer <token>`, token limited to `sources: [flags]` |
+
+Map flags to services and provider environments to your envs, so flag changes rank against the right service:
+
+```yaml
+hooks:
+  flags:
+    services: { fast-checkout: checkout-api, new-nav: web }
+    defaultService: flags
+    envs: { production: prod, staging: staging }
+```
+
+Flag changes are marked *made outside CI*, and deleting or archiving a flag is high risk.
+
+### Runbooks, scripts, anything else
 
 Use the CLI or post a CloudEvent:
 
@@ -196,10 +221,147 @@ Kinds: `deploy`, `config`, `infra`, `flag`, `access`, `scale`. Risks: `low`, `me
 | **Web UI** | `http://changefeed/`. Pick the alerting service and time, then share the link with the incident channel. |
 | **CLI** | `changefeed since 1h --env prod`, `changefeed suspects --service checkout-api --at 14:32` |
 | **Grafana** | Annotations from `GET /api/v1/grafana/annotations?env=prod&from=${__from}&to=${__to}` with the [Infinity data source](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/). Fields are `time`, `title`, `text` and `tags`. |
-| **REST API** | `GET /api/v1/events`, `/api/v1/events/{id}`, `/api/v1/suspects`, `/api/v1/meta`; `POST /api/v1/events` |
-| **Prometheus** | `rate(changefeed_events_ingested_total{kind="deploy"}[7d])` is deploy frequency per service and env. |
+| **REST API** | `GET /api/v1/events`, `/events/{id}`, `/suspects`, `/incidents`, `/dora`, `/freeze`, `/meta`; `POST /api/v1/events` |
+| **Prometheus** | `changefeed_deployments_per_day` and `changefeed_change_failure_ratio` per service and env; `rate(changefeed_events_ingested_total{kind="deploy"}[7d])` |
+| **Slack** | Incident posts and `/changefeed` (see below) |
+| **AI assistants** | `changefeed mcp` (see below) |
 
 Time parameters accept RFC 3339 (`2026-11-24T14:32:00Z`), a duration ago (`90m`) or a UTC clock time today (`14:32`).
+
+## Incidents, Slack and AI assistants
+
+### Alertmanager opens incidents
+
+Add the receiver from [`deploy/alertmanager/receiver.yaml`](deploy/alertmanager/receiver.yaml). The token needs `sources: [alertmanager]`.
+
+For each **firing** alert, changefeed:
+1. finds the service from the alert labels (`service`, `app_kubernetes_io_name`, `app`, `deployment`, `job`, configurable)
+2. ranks likely causes in the 60 minutes before the alert
+3. stores an incident with the top change set, and posts to Slack **once**, even though Alertmanager repeats notifications
+
+**Resolved** alerts close the incident. Alerts without a service label are skipped and logged.
+
+### Slack
+
+1. Create the app from [`deploy/slack/app-manifest.yaml`](deploy/slack/app-manifest.yaml).
+2. Put `CHANGEFEED_SLACK_BOT_TOKEN` and `CHANGEFEED_SLACK_SIGNING_SECRET` in the Secret.
+3. Set:
+   ```yaml
+   publicURL: https://changefeed.example.com   # links in messages
+   slack: { enabled: true, channel: "#incidents", minScore: 40 }
+   ```
+
+You get:
+- **Incident posts:** the top 3 likely causes, each with its score, reasons, actor and a link to the incident view. Changes scoring under `minScore` are left out, so a quiet "no likely change found" replaces guesswork.
+- **`/changefeed checkout-api 60m`:** likely causes right now. **`/changefeed since 2h cart`:** recent changes. Replies are visible only to you.
+
+Every request is checked against Slack's signing secret and rejected if it's older than 5 minutes. Slack failures are logged and counted (`changefeed_slack_posts_total`), and they never fail the Alertmanager webhook.
+
+### AI assistants (MCP)
+
+`changefeed mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio. Its tools are `changes_since`, `suspects`, `get_change`, `incidents` and `freeze_status`. All of them are **read-only**, and they call the API with your token, so the assistant sees exactly what your token can see.
+
+```json
+{
+  "mcpServers": {
+    "changefeed": {
+      "command": "changefeed",
+      "args": ["mcp"],
+      "env": { "CHANGEFEED_ENDPOINT": "https://changefeed.example.com", "CHANGEFEED_TOKEN": "cf_…" }
+    }
+  }
+}
+```
+
+This works in Claude Desktop, Claude Code (`claude mcp add changefeed -- changefeed mcp`), Cursor and other MCP clients. Ask: *"checkout-api started returning 5xx at 14:32. What changed?"*
+
+## Change freezes
+
+```yaml
+freezes:
+  - name: weekend
+    reason: No prod deploys at the weekend
+    envs: [prod]
+    weekly: { from: "fri 16:00", to: "mon 08:00", timezone: Asia/Dubai }
+  - name: year-end
+    services: [payments-api]
+    start: "2026-12-20T00:00:00Z"
+    end: "2027-01-03T00:00:00Z"
+```
+
+Gate deploys with the action, **before** the deploy step:
+
+```yaml
+- uses: yousafkhamza/changefeed@v0.3.0
+  with: { mode: check-freeze, endpoint: https://changefeed.example.com, service: checkout-api, env: prod }
+  # override-reason: "Hotfix for INC-123"   ← deploys anyway and records the reason
+```
+
+During a freeze, the job fails with the freeze name, end time and reason. An override is logged as a warning and recorded on the deploy event as the label `freeze-override`. Every change made during a freeze, from any source, is labeled `freeze`, and the UI shows a badge for it.
+
+`GET /api/v1/freeze?env=prod&service=checkout-api` accepts read or write credentials.
+
+## Delivery metrics (DORA)
+
+For each service and env over the last 30 days, changefeed reports:
+- **Deployments:** distinct change sets containing a deploy. A PR whose sync and rollout both appear still counts once.
+- **Deploys per day.**
+- **Change failure rate:** the share of deployments that were the **top-ranked cause, with a score of 50 or more,** of an incident.
+
+You can find these numbers in:
+- the UI, under *Delivery, last 30 days*
+- `GET /api/v1/dora?env=prod&window=30d`
+- the Prometheus gauges `changefeed_deployments_per_day` and `changefeed_change_failure_ratio`, updated every 5 minutes
+
+The change failure rate measures changefeed's ranking, not a confirmed root cause. Treat it as a trend, and confirm causes in postmortems.
+
+## Single sign-on and teams
+
+```yaml
+publicURL: https://changefeed.example.com
+auth:
+  oidc:
+    enabled: true
+    issuer: https://login.example.com     # Okta, Entra ID, Google, Keycloak, Dex…
+    clientID: changefeed
+  teams:
+    - { name: payments, groups: [payments-oncall], envs: [prod], services: [payments-api, checkout-api] }
+    - { name: platform, groups: [platform] }   # no limits: sees everything
+```
+
+You also need these values in the Secret:
+- `CHANGEFEED_SESSION_KEY`: 32 or more random characters (`openssl rand -base64 48`)
+- `CHANGEFEED_OIDC_CLIENT_SECRET`: only for confidential clients
+
+Register the redirect URL `https://changefeed.example.com/auth/callback` with your identity provider.
+
+How it works:
+- **Sign-in** uses the authorization code flow with PKCE, with state and nonce checks.
+- **ID tokens** are verified against the provider's JWKS.
+- **Sessions** are HMAC-signed cookies: `HttpOnly`, `Secure`, `SameSite=Lax`, 12 hours by default.
+- **Teams:** a user sees the union of their teams' envs and services. With no teams configured, every user who signs in sees everything. A user in no team is refused.
+
+**Tokens can be scoped the same way:** `envs: [prod]`, `services: [payments-api]`. Scoping applies to every read: events, change sets, likely causes, incidents, DORA, Grafana and the service lists.
+
+## Postgres and high availability
+
+```sh
+kubectl -n changefeed create secret generic changefeed-secrets \
+  --from-literal=CHANGEFEED_DATABASE_URL='postgres://changefeed:…@pg.example.com:5432/changefeed?sslmode=require'
+helm upgrade changefeed oci://ghcr.io/yousafkhamza/charts/changefeed -n changefeed \
+  --set existingSecret=changefeed-secrets --set postgres.enabled=true --set postgres.replicaCount=2
+```
+
+With Postgres, the chart:
+- runs several replicas with rolling updates and a PodDisruptionBudget
+- doesn't create a volume
+
+What keeps replicas consistent:
+- **Schema:** migrations run under an advisory lock, so replicas starting together don't race.
+- **Change sets:** linking is serialized per revision.
+- **Duplicates:** each replica's Kubernetes collector sees the same changes, but deterministic event IDs make sure each change is stored only once.
+
+Rate limits apply per replica.
 
 ## How ranking works
 
@@ -222,14 +384,17 @@ Changes to unrelated services are not ranked. The model is deliberately simple, 
 - **Read-only collection.** The Kubernetes collector needs get/list/watch only. AWS pushes through EventBridge, so changefeed holds no cloud credentials.
 - **Secrets never stored.** Values under sensitive-looking keys are masked. Env vars that come from Secrets are shown as `secret:name/key`, never resolved. Summaries and diffs are scanned for tokens, keys, JWTs and URL credentials before they are written. Helm release Secrets are read for their labels only.
 - **No static CI secrets.** GitHub Actions authenticate with OIDC, and the token's repository and environment are checked.
-- **Tokens stored as SHA-256 hashes**, each limited to `read` or `write` and to specific source lanes, with a per-token rate limit.
+- **Tokens stored as SHA-256 hashes**, each limited to `read` or `write`, to specific source lanes, and optionally to envs and services, with a per-token rate limit.
+- **Signed webhooks.** Slack, LaunchDarkly and Flagsmith requests are verified with HMAC-SHA256, and Slack requests older than 5 minutes are rejected.
+- **SSO for people.** OIDC with PKCE, verified ID tokens, signed `HttpOnly`/`Secure`/`SameSite=Lax` sessions, and team scoping on every read path.
+- **No secrets in config or logs.** Database URLs and Slack, OIDC and webhook secrets come only from environment variables (one Kubernetes Secret). The database DSN is never logged.
 - **Hardened HTTP.** Strict CSP with no inline script or style, request size limits, timeouts, and no stack traces in responses.
 - **Supply chain.** Images are distroless and non-root, signed with cosign (keyless), and ship an SBOM and SLSA provenance. Binaries come with checksums and build attestations. Every workflow action is pinned to a commit SHA.
 
 Verify an image:
 
 ```sh
-cosign verify ghcr.io/yousafkhamza/changefeed:v0.1.0 \
+cosign verify ghcr.io/yousafkhamza/changefeed:v0.3.0 \
   --certificate-identity-regexp 'https://github.com/yousafkhamza/changefeed/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -244,16 +409,16 @@ The server reads one YAML file (`--config` or `CHANGEFEED_CONFIG`). Unknown keys
 changefeed check-config changefeed.yaml
 ```
 
-A commented example is in [`examples/changefeed.yaml`](examples/changefeed.yaml). Environment overrides: `CHANGEFEED_LISTEN`, `CHANGEFEED_DB`.
+A commented example is in [`examples/changefeed.yaml`](examples/changefeed.yaml). Environment overrides: `CHANGEFEED_LISTEN`, `CHANGEFEED_DB`. Secrets, read only from the environment: `CHANGEFEED_DATABASE_URL`, `CHANGEFEED_SLACK_BOT_TOKEN`, `CHANGEFEED_SLACK_SIGNING_SECRET`, `CHANGEFEED_LAUNCHDARKLY_SECRET`, `CHANGEFEED_FLAGSMITH_SECRET`, `CHANGEFEED_OIDC_CLIENT_SECRET`, `CHANGEFEED_SESSION_KEY`.
 
 ## Operations
 
 | | |
 |---|---|
 | Probes | `/healthz` (process), `/readyz` (database) |
-| Metrics | `/metrics`: ingested, rejected, duplicate and ignored events, HTTP latency, build info |
+| Metrics | `/metrics`: ingested, rejected, duplicate and ignored events, incidents opened, Slack posts, deploys per day, change failure ratio, HTTP latency, build info |
 | Logs | JSON (`--log-format text` for local use) |
-| Storage | SQLite in WAL mode, purged hourly after `storage.retention` (default 30 days). Back up `/data` with your volume snapshots. |
+| Storage | SQLite in WAL mode (back up `/data` with volume snapshots) or Postgres (use your normal Postgres backups). Events and incidents are purged hourly after `storage.retention` (default 30 days). |
 | Capacity | A single pod handles thousands of events per minute. Real platforms produce hundreds per hour. |
 | Restarts | Changes made while changefeed is down are not backfilled for Kubernetes. Push sources retry: the GitHub Action retries 3 times, and EventBridge retries for an hour into a DLQ. |
 
@@ -271,10 +436,12 @@ make chart     # helm lint + template
 The project layout:
 - `cmd/changefeed`: the binary
 - `internal/event`: the schema
-- `internal/store`: SQLite and correlation
+- `internal/store`: SQLite/Postgres, correlation, incidents
 - `internal/rank`: scoring
 - `internal/collector/kube`: the cluster watcher
-- `internal/hooks`: Argo CD and AWS mappers
+- `internal/hooks`: Argo CD, AWS, Alertmanager and feature-flag mappers
+- `internal/slack`, `internal/mcp`, `internal/dora`: Slack, the MCP server, delivery metrics
+- `internal/auth`: tokens, GitHub OIDC, SSO
 - `internal/server`: the HTTP API
 - `internal/ui`: the embedded web UI
 
@@ -282,8 +449,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 
-- **v0.2:** Slack replies to alerts, an MCP server for AI assistants (`changes_since`, `suspects`), native LaunchDarkly/Unleash/Flagsmith webhooks, Postgres for HA
-- **v0.3:** change failure rate (DORA), change freeze windows, OIDC SSO and per-team scoping in the UI
+v0.2 (Alertmanager incidents, Slack, MCP, feature-flag webhooks, Postgres) and v0.3 (change failure rate, change freezes, SSO and teams) are done. Next:
+
+- Dependency map built from OpenTelemetry traces instead of `services.dependsOn`
+- Agents per cluster that push to a central server (multi-cluster)
+- PagerDuty and Opsgenie incidents; Microsoft Teams messages
+- Backfill of Kubernetes changes from rollout history after downtime
 
 ## License
 

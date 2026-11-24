@@ -1,0 +1,49 @@
+# Alertmanager: send alerts to changefeed so it opens an incident, ranks likely
+# causes and (if Slack is on) posts them. Merge into alertmanager.yml, or use
+# the AlertmanagerConfig CRD below with the Prometheus Operator.
+#
+# The token needs scopes [write] and sources [alertmanager]:
+#   changefeed token   # add the hash to auth.tokens with sources: [alertmanager]
+#
+# Alerts need a label that names the service (default: service, app_kubernetes_io_name,
+# app, deployment or job) and optionally env/environment.
+
+# --- alertmanager.yml ---
+route:
+  routes:
+    - receiver: changefeed
+      matchers: ['severity=~"critical|page"']
+      continue: true            # keep your existing pager routes
+receivers:
+  - name: changefeed
+    webhook_configs:
+      - url: http://changefeed.changefeed.svc.cluster.local/hooks/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/secrets/changefeed/token
+---
+# --- Prometheus Operator ---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: changefeed
+  namespace: monitoring
+spec:
+  route:
+    receiver: changefeed
+    matchers:
+      - { name: severity, matchType: "=~", value: "critical|page" }
+    continue: true
+  receivers:
+    - name: changefeed
+      webhookConfigs:
+        - url: http://changefeed.changefeed.svc.cluster.local/hooks/alertmanager
+          sendResolved: true
+          httpConfig:
+            authorization:
+              type: Bearer
+              credentials:
+                name: changefeed-alertmanager-token
+                key: token

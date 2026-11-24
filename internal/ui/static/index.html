@@ -24,6 +24,7 @@
       </select></label>
       <label class="live"><input type="checkbox" id="f-live" checked> Live</label>
     </form>
+    <span class="who" id="who"></span>
   </div>
 </header>
 
@@ -57,11 +58,24 @@
       <div class="pane"><div class="detail" id="detail"></div></div>
     </div>
   </section>
+
+  <section class="lower" aria-label="Incidents and delivery">
+    <div class="panel card">
+      <div class="panel-bar"><h2>Recent incidents</h2><span class="status">last 7 days · from Alertmanager</span></div>
+      <div id="incidents"></div>
+    </div>
+    <div class="panel card">
+      <div class="panel-bar"><h2>Delivery, last 30 days</h2><span class="status" title="A deployment fails when it was the top-ranked cause (score 50 or more) of an incident">change failure rate is changefeed's ranking</span></div>
+      <div class="table-wrap"><table class="dora" id="dora"></table></div>
+    </div>
+  </section>
 </main>
 
 <dialog id="login" aria-labelledby="login-title">
   <form method="dialog" id="login-form" class="login">
     <h2 id="login-title">Sign in to changefeed</h2>
+    <a class="sso-btn" id="login-sso" href="auth/login" hidden>Sign in with your company account</a>
+    <p class="or" id="login-or" hidden>or use a token</p>
     <p>Paste a token with the <code>read</code> scope. It is kept in this browser tab only.</p>
     <label for="login-token">Token</label>
     <input id="login-token" type="password" autocomplete="off" spellcheck="false" required>

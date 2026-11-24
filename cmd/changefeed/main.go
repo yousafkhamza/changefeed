@@ -3,6 +3,7 @@ package main
 
 import (
 	"os"
+	_ "time/tzdata" // freeze windows use IANA time zones; the image may lack /usr/share/zoneinfo
 
 	"github.com/yousafkhamza/changefeed/internal/cli"
 )

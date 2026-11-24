@@ -1,8 +1,10 @@
-// Package store persists events in SQLite and links them into change sets.
+// Package store persists events and incidents and links events into change sets.
 //
-// SQLite (pure Go, no CGO) keeps the default install to one pod with one
-// volume. Writes are serialized through a single connection, which is far
-// beyond the change rate of any real platform (hundreds per hour).
+// Two backends share one implementation:
+//   - SQLite (default): pure Go, no CGO, one pod with one volume. Writes are
+//     serialized through a single connection, far beyond the change rate of
+//     any real platform (hundreds per hour).
+//   - Postgres: for running several replicas. Selected by a postgres:// DSN.
 package store
 
 import (
@@ -14,24 +16,30 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/yousafkhamza/changefeed/internal/event"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver
+	_ "modernc.org/sqlite"             // registers the "sqlite" driver
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	"github.com/yousafkhamza/changefeed/internal/event"
 )
 
-// ErrNotFound is returned when an event does not exist.
+// ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
-// Store is a SQLite-backed event store.
-type Store struct{ db *sql.DB }
+// Store is a SQL-backed event store.
+type Store struct {
+	db       *sql.DB
+	postgres bool
+}
 
 // Filter selects events. Zero values mean "no filter".
 type Filter struct {
 	Since, Until time.Time
 	Env          string
+	Envs         []string // access scope: only these envs (empty = all)
 	Services     []string
 	Kinds        []event.Kind
 	Source       string
@@ -39,30 +47,45 @@ type Filter struct {
 	Limit        int
 }
 
-const schema = `
+const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS events (
-  id         TEXT PRIMARY KEY,
-  time       INTEGER NOT NULL,
-  received   INTEGER NOT NULL,
-  source     TEXT NOT NULL,
-  origin     TEXT NOT NULL DEFAULT '',
-  kind       TEXT NOT NULL,
-  service    TEXT NOT NULL,
-  env        TEXT NOT NULL,
-  actor      TEXT NOT NULL DEFAULT '',
-  summary    TEXT NOT NULL,
-  risk       TEXT NOT NULL,
-  revision   TEXT NOT NULL DEFAULT '',
-  rev7       TEXT NOT NULL DEFAULT '',
-  changeset  TEXT NOT NULL DEFAULT '',
-  outside_ci INTEGER NOT NULL DEFAULT 0,
-  extra      TEXT NOT NULL DEFAULT '{}'
+  id TEXT PRIMARY KEY, time INTEGER NOT NULL, received INTEGER NOT NULL, source TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, service TEXT NOT NULL, env TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL, risk TEXT NOT NULL, revision TEXT NOT NULL DEFAULT '',
+  rev7 TEXT NOT NULL DEFAULT '', changeset TEXT NOT NULL DEFAULT '', outside_ci INTEGER NOT NULL DEFAULT 0,
+  extra TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS events_env_time     ON events(env, time);
 CREATE INDEX IF NOT EXISTS events_service_time ON events(service, time);
 CREATE INDEX IF NOT EXISTS events_rev7         ON events(rev7) WHERE rev7 <> '';
 CREATE INDEX IF NOT EXISTS events_changeset    ON events(changeset) WHERE changeset <> '';
-PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS incidents (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, env TEXT NOT NULL, title TEXT NOT NULL,
+  source TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', started_at INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0,
+  top_changeset TEXT NOT NULL DEFAULT '', top_score INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS incidents_env_started ON incidents(env, started_at);
+PRAGMA user_version = 2;
+`
+
+const postgresSchema = `
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY, time BIGINT NOT NULL, received BIGINT NOT NULL, source TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, service TEXT NOT NULL, env TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL, risk TEXT NOT NULL, revision TEXT NOT NULL DEFAULT '',
+  rev7 TEXT NOT NULL DEFAULT '', changeset TEXT NOT NULL DEFAULT '', outside_ci INTEGER NOT NULL DEFAULT 0,
+  extra TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS events_env_time     ON events(env, time);
+CREATE INDEX IF NOT EXISTS events_service_time ON events(service, time);
+CREATE INDEX IF NOT EXISTS events_rev7         ON events(rev7) WHERE rev7 <> '';
+CREATE INDEX IF NOT EXISTS events_changeset    ON events(changeset) WHERE changeset <> '';
+CREATE TABLE IF NOT EXISTS incidents (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, env TEXT NOT NULL, title TEXT NOT NULL,
+  source TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', started_at BIGINT NOT NULL, resolved_at BIGINT NOT NULL DEFAULT 0,
+  top_changeset TEXT NOT NULL DEFAULT '', top_score INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS incidents_env_started ON incidents(env, started_at);
 `
 
 // extra holds the variable-length fields as one JSON column.
@@ -72,14 +95,27 @@ type extra struct {
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
-// Open opens (and creates) the database at path. Use ":memory:" in tests.
-func Open(path string) (*Store, error) {
+// IsPostgres reports whether dsn selects the Postgres backend.
+func IsPostgres(dsn string) bool {
+	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
+}
+
+// Open opens (and migrates) the store. dsn is a SQLite file path, ":memory:",
+// or a postgres:// URL.
+func Open(dsn string) (*Store, error) {
+	if IsPostgres(dsn) {
+		return openPostgres(dsn)
+	}
+	return openSQLite(dsn)
+}
+
+func openSQLite(path string) (*Store, error) {
 	if path != ":memory:" {
 		if strings.ContainsAny(path, "?#") {
 			return nil, fmt.Errorf("storage path %q must not contain '?' or '#'", path)
 		}
 		if dir := filepath.Dir(path); dir != "." {
-			if err := os.MkdirAll(dir, 0o750); err != nil {
+			if err := os.MkdirAll(dir, 0o750); err != nil { //nolint:gosec // G703: the operator chooses the storage path
 				return nil, fmt.Errorf("create data dir: %w", err)
 			}
 		}
@@ -91,18 +127,55 @@ func Open(path string) (*Store, error) {
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Set("_txlock", "immediate")
-	dsn := path + "?" + q.Encode()
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", path+"?"+q.Encode())
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxIdleTime(0)
-	if _, err := db.ExecContext(context.Background(), schema); err != nil {
+	if _, err := db.ExecContext(context.Background(), sqliteSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+func openPostgres(dsn string) (*Store, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Replicas starting together must not race on CREATE TABLE.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("connect to postgres: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(727301)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migration lock: %w", err)
+	}
+	_, migErr := conn.ExecContext(ctx, postgresSchema)
+	_, _ = conn.ExecContext(ctx, `SELECT pg_advisory_unlock(727301)`)
+	if migErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate: %w", migErr)
+	}
+	return &Store{db: db, postgres: true}, nil
+}
+
+// Backend names the storage engine, for logs.
+func (s *Store) Backend() string {
+	if s.postgres {
+		return "postgres"
+	}
+	return "sqlite"
 }
 
 // Close closes the database.
@@ -110,6 +183,24 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // Ping checks the database is usable (readiness probe).
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// rebind turns ? placeholders into $1, $2 … for Postgres.
+func (s *Store) rebind(q string) string {
+	if !s.postgres {
+		return q
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range q {
+		if r == '?' {
+			n++
+			b.WriteString("$" + strconv.Itoa(n))
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
 
 // Insert stores e and links it into a change set. It returns false when an
 // event with the same ID already exists, which makes retries safe.
@@ -128,14 +219,20 @@ func (s *Store) Insert(ctx context.Context, e *event.Event) (bool, error) {
 	defer tx.Rollback() //nolint:errcheck // no-op after commit
 
 	rev7 := event.ShortRev(e.Revision)
+	if s.postgres && rev7 != "" {
+		// Serialize linking per revision across replicas.
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, rev7); err != nil {
+			return false, err
+		}
+	}
 	switch {
 	case e.ChangeSet != "" && rev7 != "":
-		if _, err := tx.ExecContext(ctx, `UPDATE events SET changeset = ? WHERE rev7 = ? AND changeset = ?`, e.ChangeSet, rev7, "rev:"+rev7); err != nil {
+		if _, err := tx.ExecContext(ctx, s.rebind(`UPDATE events SET changeset = ? WHERE rev7 = ? AND changeset = ?`), e.ChangeSet, rev7, "rev:"+rev7); err != nil {
 			return false, err
 		}
 	case e.ChangeSet == "" && rev7 != "":
 		var cs string
-		err := tx.QueryRowContext(ctx, `SELECT changeset FROM events WHERE rev7 = ? AND changeset <> '' ORDER BY time DESC LIMIT 1`, rev7).Scan(&cs)
+		err := tx.QueryRowContext(ctx, s.rebind(`SELECT changeset FROM events WHERE rev7 = ? AND changeset <> '' ORDER BY time DESC LIMIT 1`), rev7).Scan(&cs)
 		switch {
 		case err == nil:
 			e.ChangeSet = cs
@@ -150,9 +247,13 @@ func (s *Store) Insert(ctx context.Context, e *event.Event) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO events
+	verb, tail := "INSERT OR IGNORE INTO", ""
+	if s.postgres {
+		verb, tail = "INSERT INTO", " ON CONFLICT (id) DO NOTHING"
+	}
+	res, err := tx.ExecContext(ctx, s.rebind(verb+` events
 		(id, time, received, source, origin, kind, service, env, actor, summary, risk, revision, rev7, changeset, outside_ci, extra)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`+tail),
 		e.ID, e.Time.Unix(), e.Received.Unix(), e.Source, e.Origin, string(e.Kind), e.Service, e.Env, e.Actor,
 		e.Summary, string(e.Risk), e.Revision, rev7, e.ChangeSet, boolInt(e.OutsideCI), string(ex))
 	if err != nil {
@@ -181,6 +282,9 @@ func (s *Store) List(ctx context.Context, f Filter) ([]event.Event, error) {
 	if f.Env != "" {
 		add("env = ?", f.Env)
 	}
+	if len(f.Envs) > 0 {
+		add("env IN ("+placeholders(len(f.Envs))+")", toAny(f.Envs)...)
+	}
 	if f.Source != "" {
 		add("source = ?", f.Source)
 	}
@@ -203,12 +307,12 @@ func (s *Store) List(ctx context.Context, f Filter) ([]event.Event, error) {
 	}
 	q := `SELECT id, time, received, source, origin, kind, service, env, actor, summary, risk, revision, changeset, outside_ci, extra FROM events`
 	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ") //nolint:gosec // G202: only constant clauses with ? placeholders are joined
+		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY time DESC, id LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +330,7 @@ func (s *Store) List(ctx context.Context, f Filter) ([]event.Event, error) {
 
 // Get returns one event.
 func (s *Store) Get(ctx context.Context, id string) (event.Event, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, time, received, source, origin, kind, service, env, actor, summary, risk, revision, changeset, outside_ci, extra FROM events WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, s.rebind(`SELECT id, time, received, source, origin, kind, service, env, actor, summary, risk, revision, changeset, outside_ci, extra FROM events WHERE id = ?`), id)
 	e, err := scan(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return e, ErrNotFound
@@ -246,7 +350,7 @@ type Meta struct {
 func (s *Store) Meta(ctx context.Context, since time.Time) (Meta, error) {
 	m := Meta{Envs: []string{}, Services: []string{}, Sources: []string{}}
 	for col, dst := range map[string]*[]string{"env": &m.Envs, "service": &m.Services, "source": &m.Sources} {
-		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT `+col+` FROM events WHERE time >= ? ORDER BY 1 LIMIT 500`, since.Unix()) //nolint:gosec // G202: col comes from a fixed map of column names
+		rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT DISTINCT `+col+` FROM events WHERE time >= ? ORDER BY 1 LIMIT 500`), since.Unix())
 		if err != nil {
 			return m, err
 		}
@@ -266,9 +370,13 @@ func (s *Store) Meta(ctx context.Context, since time.Time) (Meta, error) {
 	return m, nil
 }
 
-// Purge deletes events older than before and returns how many were removed.
+// Purge deletes events and incidents older than before and returns how many
+// events were removed.
 func (s *Store) Purge(ctx context.Context, before time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM events WHERE time < ?`, before.Unix())
+	if _, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM incidents WHERE started_at < ?`), before.Unix()); err != nil {
+		return 0, err
+	}
+	res, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM events WHERE time < ?`), before.Unix())
 	if err != nil {
 		return 0, err
 	}

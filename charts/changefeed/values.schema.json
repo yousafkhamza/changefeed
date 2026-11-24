@@ -51,7 +51,9 @@
                   "name": { "type": "string", "minLength": 1 },
                   "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
                   "scopes": { "type": "array", "minItems": 1, "items": { "enum": ["read", "write"] } },
-                  "sources": { "type": "array", "items": { "type": "string" } }
+                  "sources": { "type": "array", "items": { "type": "string" } },
+                  "envs": { "type": "array", "items": { "type": "string" } },
+                  "services": { "type": "array", "items": { "type": "string" } }
                 }
               }
             },
@@ -69,6 +71,33 @@
             "rateLimit": {
               "type": "object",
               "properties": { "perMinute": { "type": "integer", "minimum": 0 } }
+            },
+            "oidc": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "issuer": { "type": "string" },
+                "clientID": { "type": "string" },
+                "redirectURL": { "type": "string" },
+                "scopes": { "type": "array", "items": { "type": "string" } },
+                "groupsClaim": { "type": "string" },
+                "sessionTTL": { "type": "string" }
+              }
+            },
+            "teams": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "groups"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "groups": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                  "envs": { "type": "array", "items": { "type": "string" } },
+                  "services": { "type": "array", "items": { "type": "string" } }
+                }
+              }
             }
           }
         },
@@ -98,7 +127,51 @@
             "properties": { "dependsOn": { "type": "array", "items": { "type": "string" } } }
           }
         },
-        "platformServices": { "type": "array", "items": { "type": "string" } }
+        "platformServices": { "type": "array", "items": { "type": "string" } },
+      "slack": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "channel": { "type": "string" },
+          "minScore": { "type": "integer", "minimum": 0, "maximum": 99 },
+          "apiURL": { "type": "string" }
+        }
+      },
+      "freezes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string" },
+            "envs": { "type": "array", "items": { "type": "string" } },
+            "services": { "type": "array", "items": { "type": "string" } },
+            "start": { "type": "string" },
+            "end": { "type": "string" },
+            "weekly": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "to"],
+              "properties": {
+                "from": { "type": "string", "pattern": "^(mon|tue|wed|thu|fri|sat|sun) [0-2][0-9]:[0-5][0-9]$" },
+                "to": { "type": "string", "pattern": "^(mon|tue|wed|thu|fri|sat|sun) [0-2][0-9]:[0-5][0-9]$" },
+                "timezone": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+      }
+    },
+    "existingSecret": { "type": "string" },
+    "postgres": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicaCount": { "type": "integer", "minimum": 1, "maximum": 10 }
       }
     },
     "service": {

@@ -26,12 +26,85 @@ type Config struct {
 	Services map[string]Service `json:"services"`
 	// PlatformServices are shared by everything (e.g. "platform", "network").
 	PlatformServices []string `json:"platformServices"`
+	Slack            Slack    `json:"slack"`
+	// Freezes are change freeze windows; deploys check them via /api/v1/freeze.
+	Freezes []Freeze `json:"freezes"`
+
+	// Secrets come only from the environment (a Kubernetes Secret), never the file.
+	Secrets Secrets `json:"-"`
 }
 
-// Storage configures the SQLite database.
+// Secrets are read from environment variables by Load.
+type Secrets struct {
+	DatabaseURL      string // CHANGEFEED_DATABASE_URL (postgres://…)
+	SlackBotToken    string // CHANGEFEED_SLACK_BOT_TOKEN
+	SlackSigning     string // CHANGEFEED_SLACK_SIGNING_SECRET
+	LaunchDarkly     string // CHANGEFEED_LAUNCHDARKLY_SECRET
+	Flagsmith        string // CHANGEFEED_FLAGSMITH_SECRET
+	OIDCClientSecret string // CHANGEFEED_OIDC_CLIENT_SECRET
+	SessionKey       string // CHANGEFEED_SESSION_KEY (32+ random bytes, base64 or raw)
+}
+
+// Storage configures the database. Path is a SQLite file; set
+// CHANGEFEED_DATABASE_URL to a postgres:// URL to use Postgres instead.
 type Storage struct {
 	Path      string   `json:"path"`
 	Retention Duration `json:"retention"`
+}
+
+// DSN is what store.Open receives.
+func (c *Config) DSN() string {
+	if c.Secrets.DatabaseURL != "" {
+		return c.Secrets.DatabaseURL
+	}
+	return c.Storage.Path
+}
+
+// Slack posts likely causes when an alert fires and answers /changefeed.
+type Slack struct {
+	Enabled bool   `json:"enabled"`
+	Channel string `json:"channel"` // channel ID or #name for incident posts
+	// MinScore is the lowest top score worth posting; below it a quiet
+	// "no likely change found" message is sent instead.
+	MinScore int    `json:"minScore"`
+	APIURL   string `json:"apiURL"` // override for tests or Slack GovSlack
+}
+
+// Freeze is a change freeze window, either one-off (start/end) or weekly.
+type Freeze struct {
+	Name     string   `json:"name"`
+	Reason   string   `json:"reason"`
+	Envs     []string `json:"envs"`     // empty = all envs
+	Services []string `json:"services"` // empty = all services
+	Start    string   `json:"start"`    // RFC 3339, with End
+	End      string   `json:"end"`
+	Weekly   *Weekly  `json:"weekly"`
+}
+
+// Weekly repeats every week, e.g. Friday 16:00 to Monday 08:00.
+type Weekly struct {
+	From     string `json:"from"`     // "fri 16:00"
+	To       string `json:"to"`       // "mon 08:00"
+	Timezone string `json:"timezone"` // IANA name, default UTC
+}
+
+// OIDC signs people in to the web UI with the company identity provider.
+type OIDC struct {
+	Enabled     bool     `json:"enabled"`
+	Issuer      string   `json:"issuer"`
+	ClientID    string   `json:"clientID"`
+	RedirectURL string   `json:"redirectURL"` // default: publicURL + /auth/callback
+	Scopes      []string `json:"scopes"`
+	GroupsClaim string   `json:"groupsClaim"`
+	SessionTTL  Duration `json:"sessionTTL"`
+}
+
+// Team limits what members of identity-provider groups can see.
+type Team struct {
+	Name     string   `json:"name"`
+	Groups   []string `json:"groups"`
+	Envs     []string `json:"envs"`     // empty = all
+	Services []string `json:"services"` // empty = all
 }
 
 // Auth configures who may read and write events.
@@ -42,14 +115,19 @@ type Auth struct {
 	Tokens        []Token       `json:"tokens"`
 	GitHub        GitHubOIDC    `json:"github"`
 	RateLimit     RateLimitSpec `json:"rateLimit"`
+	OIDC          OIDC          `json:"oidc"`
+	// Teams scope what SSO users see. Empty means every signed-in user sees everything.
+	Teams []Team `json:"teams"`
 }
 
 // Token is a bearer token, stored as the hex SHA-256 of the secret.
 type Token struct {
-	Name    string   `json:"name"`
-	SHA256  string   `json:"sha256"`
-	Scopes  []string `json:"scopes"`  // read, write
-	Sources []string `json:"sources"` // lanes this token may write; empty means any
+	Name     string   `json:"name"`
+	SHA256   string   `json:"sha256"`
+	Scopes   []string `json:"scopes"`   // read, write
+	Sources  []string `json:"sources"`  // lanes this token may write; empty means any
+	Envs     []string `json:"envs"`     // read scope: only these envs; empty means all
+	Services []string `json:"services"` // read scope: only these services; empty means all
 }
 
 // GitHubOIDC trusts GitHub Actions OIDC tokens from the listed repositories.
@@ -86,8 +164,45 @@ type Kubernetes struct {
 
 // Hooks configures push sources.
 type Hooks struct {
-	ArgoCD ArgoCD `json:"argocd"`
-	AWS    AWS    `json:"aws"`
+	ArgoCD       ArgoCD       `json:"argocd"`
+	AWS          AWS          `json:"aws"`
+	Alertmanager Alertmanager `json:"alertmanager"`
+	Flags        Flags        `json:"flags"`
+}
+
+// Alertmanager turns firing alerts into incidents and ranks changes for them.
+type Alertmanager struct {
+	ServiceLabels []string `json:"serviceLabels"` // first label present names the service
+	EnvLabels     []string `json:"envLabels"`
+	DefaultEnv    string   `json:"defaultEnv"`
+	Window        Duration `json:"window"` // how far back to look for causes
+}
+
+// Flags maps feature-flag provider names to changefeed services and envs.
+type Flags struct {
+	Services       map[string]string `json:"services"` // flag key -> service
+	DefaultService string            `json:"defaultService"`
+	Envs           map[string]string `json:"envs"` // provider env (e.g. "production") -> changefeed env
+	DefaultEnv     string            `json:"defaultEnv"`
+}
+
+// Service returns the service a flag belongs to.
+func (f Flags) Service(flag string) string {
+	if s, ok := f.Services[flag]; ok {
+		return s
+	}
+	return f.DefaultService
+}
+
+// Env maps a provider environment name.
+func (f Flags) Env(providerEnv string) string {
+	if e, ok := f.Envs[providerEnv]; ok {
+		return e
+	}
+	if f.DefaultEnv != "" {
+		return f.DefaultEnv
+	}
+	return providerEnv
 }
 
 // ArgoCD maps Argo CD applications to environments.
@@ -153,9 +268,28 @@ func Default() Config {
 			Env: "prod", Watch: []string{"deployments", "statefulsets", "daemonsets", "configmaps"}, ConfigMapValues: true,
 			IgnoreNamespaces: []string{"kube-system", "kube-public", "kube-node-lease"},
 		}},
-		Hooks:    Hooks{ArgoCD: ArgoCD{DefaultEnv: "prod"}, AWS: AWS{DefaultEnv: "prod"}},
+		Hooks: Hooks{
+			ArgoCD: ArgoCD{DefaultEnv: "prod"}, AWS: AWS{DefaultEnv: "prod"},
+			Alertmanager: Alertmanager{
+				ServiceLabels: []string{"service", "app_kubernetes_io_name", "app", "deployment", "job"},
+				EnvLabels:     []string{"env", "environment"}, DefaultEnv: "prod", Window: Duration{time.Hour},
+			},
+			Flags: Flags{DefaultService: "flags"},
+		},
 		Services: map[string]Service{},
+		Slack:    Slack{Channel: "#incidents", MinScore: 40, APIURL: "https://slack.com/api"},
 	}
+}
+
+// secretEnv lists environment variables that hold secrets.
+var secretEnv = map[string]func(*Secrets) *string{
+	"CHANGEFEED_DATABASE_URL":         func(s *Secrets) *string { return &s.DatabaseURL },
+	"CHANGEFEED_SLACK_BOT_TOKEN":      func(s *Secrets) *string { return &s.SlackBotToken },
+	"CHANGEFEED_SLACK_SIGNING_SECRET": func(s *Secrets) *string { return &s.SlackSigning },
+	"CHANGEFEED_LAUNCHDARKLY_SECRET":  func(s *Secrets) *string { return &s.LaunchDarkly },
+	"CHANGEFEED_FLAGSMITH_SECRET":     func(s *Secrets) *string { return &s.Flagsmith },
+	"CHANGEFEED_OIDC_CLIENT_SECRET":   func(s *Secrets) *string { return &s.OIDCClientSecret },
+	"CHANGEFEED_SESSION_KEY":          func(s *Secrets) *string { return &s.SessionKey },
 }
 
 // Load reads YAML from path (optional) over the defaults and applies env overrides.
@@ -175,6 +309,24 @@ func Load(path string) (Config, error) {
 	}
 	if v := os.Getenv("CHANGEFEED_DB"); v != "" {
 		cfg.Storage.Path = v
+	}
+	for name, field := range secretEnv {
+		*field(&cfg.Secrets) = strings.TrimSpace(os.Getenv(name))
+	}
+	if cfg.Auth.OIDC.Enabled {
+		o := &cfg.Auth.OIDC
+		if o.RedirectURL == "" && cfg.PublicURL != "" {
+			o.RedirectURL = strings.TrimRight(cfg.PublicURL, "/") + "/auth/callback"
+		}
+		if len(o.Scopes) == 0 {
+			o.Scopes = []string{"openid", "email", "profile", "groups"}
+		}
+		if o.GroupsClaim == "" {
+			o.GroupsClaim = "groups"
+		}
+		if o.SessionTTL.Duration == 0 {
+			o.SessionTTL.Duration = 12 * time.Hour
+		}
 	}
 	return cfg, cfg.Validate()
 }
@@ -212,6 +364,36 @@ func (c *Config) Validate() error {
 			if s != "read" && s != "write" {
 				errs = append(errs, fmt.Errorf("auth.tokens[%d] (%s): unknown scope %q", i, t.Name, s))
 			}
+		}
+	}
+	if o := c.Auth.OIDC; o.Enabled {
+		if !strings.HasPrefix(o.Issuer, "https://") {
+			errs = append(errs, errors.New("auth.oidc.issuer must be an https:// URL"))
+		}
+		if o.ClientID == "" {
+			errs = append(errs, errors.New("auth.oidc.clientID is required"))
+		}
+		if o.RedirectURL == "" {
+			errs = append(errs, errors.New("auth.oidc.redirectURL (or publicURL) is required"))
+		}
+		if len(c.Secrets.SessionKey) < 32 {
+			errs = append(errs, errors.New("auth.oidc needs CHANGEFEED_SESSION_KEY with at least 32 characters (e.g. openssl rand -base64 48)"))
+		}
+	}
+	for i, tm := range c.Auth.Teams {
+		if tm.Name == "" || len(tm.Groups) == 0 {
+			errs = append(errs, fmt.Errorf("auth.teams[%d]: name and at least one group are required", i))
+		}
+	}
+	if c.Slack.Enabled && (c.Secrets.SlackBotToken == "" || c.Slack.Channel == "") {
+		errs = append(errs, errors.New("slack.enabled needs slack.channel and CHANGEFEED_SLACK_BOT_TOKEN"))
+	}
+	if c.Secrets.DatabaseURL != "" && !strings.HasPrefix(c.Secrets.DatabaseURL, "postgres://") && !strings.HasPrefix(c.Secrets.DatabaseURL, "postgresql://") {
+		errs = append(errs, errors.New("CHANGEFEED_DATABASE_URL must start with postgres://"))
+	}
+	for i, f := range c.Freezes {
+		if err := f.check(); err != nil {
+			errs = append(errs, fmt.Errorf("freezes[%d] (%s): %w", i, f.Name, err))
 		}
 	}
 	if c.Auth.GitHub.Enabled {

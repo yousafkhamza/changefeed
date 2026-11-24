@@ -201,7 +201,7 @@ ${c("$")} helm install changefeed oci://ghcr.io/yousafkhamza/charts/changefeed \
   ${k("contents")}: read
 
 ${k("steps")}:
-  - ${k("uses")}: ${v("yousafkhamza/changefeed@v0.1.0")}
+  - ${k("uses")}: ${v("yousafkhamza/changefeed@v0.3.0")}
     ${k("with")}:
       ${k("endpoint")}: ${v("https://changefeed.example.com")}
       ${k("service")}: ${v("checkout-api")}
@@ -225,7 +225,7 @@ ${k("trigger.changefeed-on-sync-succeeded")}: |
     { id: "aws", name: "AWS CloudTrail", hint: "EventBridge, no AWS keys",
       text: "A Terraform module forwards successful write calls from CloudTrail to changefeed. Read-only and failed calls are dropped inside AWS. Undelivered events go to a dead-letter queue with an optional alarm.",
       code: `${k("module")} ${v('"changefeed_cloudtrail"')} {
-  ${k("source")}   = ${v('"github.com/yousafkhamza/changefeed//deploy/terraform/aws-cloudtrail?ref=v0.1.0"')}
+  ${k("source")}   = ${v('"github.com/yousafkhamza/changefeed//deploy/terraform/aws-cloudtrail?ref=v0.3.0"')}
   ${k("endpoint")} = ${v('"https://changefeed.example.com"')}
   ${k("token")}    = var.changefeed_aws_token  ${c("# scopes [write], sources [aws]")}
   ${k("services")} = [${v('"rds"')}, ${v('"iam"')}, ${v('"ec2"')}, ${v('"eks"')}, ${v('"elasticloadbalancing"')}]
@@ -239,6 +239,42 @@ ${c("$")} changefeed emit --service platform --env prod --from-plan plan.json
 ${c("created chg_4b1e… (change set -)")}
 ${c("# Terraform apply: 2 to add, 1 to change, 1 to replace, 0 to destroy")}`,
       steps: ["Works in any CI: set CHANGEFEED_ENDPOINT and CHANGEFEED_TOKEN.", "Add --revision $GIT_SHA to link the apply to its PR."] },
+    { id: "am", name: "Alertmanager + Slack", hint: "incidents, posted once",
+      text: "Firing alerts open an incident. changefeed ranks the likely causes and posts the top three to Slack once, even though Alertmanager repeats notifications. Resolved alerts close the incident.",
+      code: `${c("# alertmanager.yml (full file: deploy/alertmanager/)")}
+${k("receivers")}:
+  - ${k("name")}: ${v("changefeed")}
+    ${k("webhook_configs")}:
+      - ${k("url")}: ${v("http://changefeed.changefeed.svc/hooks/alertmanager")}
+        ${k("send_resolved")}: true
+        ${k("http_config")}: { ${k("authorization")}: { ${k("credentials_file")}: ${v("/etc/am/changefeed-token")} } }
+
+${c("# changefeed values.yaml")}
+${k("config")}:
+  ${k("publicURL")}: ${v("https://changefeed.example.com")}
+  ${k("slack")}: { ${k("enabled")}: true, ${k("channel")}: ${v('"#incidents"')}, ${k("minScore")}: 40 }`,
+      steps: ["Create the Slack app from deploy/slack/app-manifest.yaml. It also adds /changefeed <service> and /changefeed since 2h.", "Alerts need a service label (service, app, job …). Requests from Slack are signature-checked."] },
+    { id: "mcp", name: "AI assistants", hint: "MCP, read-only",
+      text: "changefeed mcp lets Claude, Cursor or Copilot answer “what changed?” with real data. Every tool is read-only and uses your token, so the assistant sees only what you can see.",
+      code: `${c("$")} claude mcp add changefeed --env CHANGEFEED_ENDPOINT=https://changefeed.example.com \\
+    --env CHANGEFEED_TOKEN=cf_… -- changefeed mcp
+
+${c("# tools")}
+${k("changes_since")}(window, service?, env?, kind?)
+${k("suspects")}(service, at?, window?, env?)
+${k("get_change")}(id)   ${k("incidents")}(since?)   ${k("freeze_status")}(env, service?)`,
+      steps: ["Works with any MCP client over stdio.", "Pairs well with an incident assistant: it asks changefeed what changed, then reads logs and metrics."] },
+    { id: "freeze", name: "Change freeze", hint: "CI gate",
+      text: "Define freeze windows once. Pipelines check them before deploying, and emergency overrides need a written reason that is recorded on the event.",
+      code: `${c("# values.yaml")}
+${k("freezes")}:
+  - { ${k("name")}: ${v("weekend")}, ${k("envs")}: [prod], ${k("weekly")}: { ${k("from")}: ${v('"fri 16:00"')}, ${k("to")}: ${v('"mon 08:00"')}, ${k("timezone")}: ${v("Asia/Dubai")} } }
+
+${c("# workflow, before the deploy step")}
+- ${k("uses")}: ${v("yousafkhamza/changefeed@v0.3.0")}
+  ${k("with")}: { ${k("mode")}: ${v("check-freeze")}, ${k("endpoint")}: ${v("https://changefeed.example.com")}, ${k("service")}: ${v("checkout-api")}, ${k("env")}: ${v("prod")} }
+  ${c("# override-reason: \"Hotfix for INC-123\"")}`,
+      steps: ["Every change made during a freeze, from any source, is labeled and badged in the UI.", "Deploys per day and change failure rate per service are on the dashboard and in Prometheus."] },
     { id: "any", name: "Anything else", hint: "CLI or CloudEvents",
       text: "Feature flags, runbooks and scripts can send a CloudEvent over HTTP, or call the CLI.",
       code: `${c("$")} changefeed emit --service checkout-api --env prod --kind flag \\

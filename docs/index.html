@@ -251,7 +251,7 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;justify-content:space-bet
         </div>
         <div class="install">
           <span class="cmd-label">Try the sample incident</span>
-          <div class="cmd"><span class="p">$</span><code id="cmd-demo">docker run --rm -p 8080:8080 ghcr.io/yousafkhamza/changefeed:v0.1.0 serve --demo</code><button class="copy" type="button" data-copy="cmd-demo">Copy</button></div>
+          <div class="cmd"><span class="p">$</span><code id="cmd-demo">docker run --rm -p 8080:8080 ghcr.io/yousafkhamza/changefeed:v0.3.0 serve --demo</code><button class="copy" type="button" data-copy="cmd-demo">Copy</button></div>
           <span class="cmd-label">Install in your cluster</span>
           <div class="cmd"><span class="p">$</span><code id="cmd-helm">helm install changefeed oci://ghcr.io/yousafkhamza/charts/changefeed -n changefeed --create-namespace</code><button class="copy" type="button" data-copy="cmd-helm">Copy</button></div>
           <div class="facts"><span>Single Go binary</span><span>Read-only collectors</span><span>Secret values never stored</span><span>Apache-2.0</span></div>
@@ -315,7 +315,9 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;justify-content:space-bet
           <div class="node">Helm <small>release metadata</small></div>
           <div class="node">Terraform <small>plan JSON · planlens</small></div>
           <div class="node">AWS CloudTrail <small>EventBridge · write calls only</small></div>
-          <div class="node">Feature flags, runbooks <small>CLI · CloudEvents API</small></div>
+          <div class="node">Feature flags <small>LaunchDarkly · Unleash · Flagsmith</small></div>
+          <div class="node">Alertmanager <small>alerts open incidents</small></div>
+          <div class="node">Runbooks, scripts <small>CLI · CloudEvents API</small></div>
         </div>
         <div class="core">
           <p class="eyebrow">changefeed server</p>
@@ -324,7 +326,7 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;justify-content:space-bet
           <div class="stage"><span class="num">3</span><div><b>Redact</b><p>Sensitive keys and Secret-sourced env vars are masked. Tokens, keys, JWTs and URL credentials in diffs are removed before storage.</p></div></div>
           <div class="stage"><span class="num">4</span><div><b>Correlate</b><p>Events are grouped into change sets by PR number and commit SHA. A full SHA, an Argo CD revision and a short image tag all match.</p></div></div>
           <div class="stage"><span class="num">5</span><div><b>Rank</b><p>Change sets are scored against an incident by service, dependencies, time gap, risk and whether they skipped CI. Every point has a reason.</p></div></div>
-          <p class="store">storage: SQLite (WAL) on one volume · retention 30 days</p>
+          <p class="store">storage: SQLite on one volume, or Postgres for several replicas · retention 30 days</p>
         </div>
         <div class="col">
           <p class="eyebrow">Where you read it</p>
@@ -333,8 +335,9 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;justify-content:space-bet
           <div class="node">Grafana <small>annotations on any panel</small></div>
           <div class="node">REST API <small>JSON · CloudEvents</small></div>
           <div class="node">Prometheus <small>deploy frequency, ingest health</small></div>
-          <div class="node soon">Slack <small>v0.2</small></div>
-          <div class="node soon">AI assistants (MCP) <small>v0.2</small></div>
+          <div class="node">Slack <small>incident posts · /changefeed</small></div>
+          <div class="node">AI assistants <small>MCP server, read-only</small></div>
+          <div class="node">Delivery metrics <small>deploys/day · change failure rate</small></div>
         </div>
       </div>
     </div>
@@ -415,20 +418,20 @@ sum by (env) (increase(changefeed_events_ingested_total{kind="deploy"}[1d]))</pr
         <div class="def"><h3>Read-only access</h3><p>The cluster role grants only get, list and watch, or a namespaced Role if you list namespaces. AWS pushes through EventBridge, so changefeed holds no cloud credentials.</p></div>
         <div class="def"><h3>No secret values</h3><p>Sensitive-looking keys are masked. Env vars from Secrets are shown by reference, never resolved. Helm release Secrets are read for their labels only.</p></div>
         <div class="def"><h3>No static CI secrets</h3><p>GitHub Actions sign in with OIDC, checked against allowed repositories and environments. The actor and repository come from the signed token, not the request body.</p></div>
-        <div class="def"><h3>Scoped tokens</h3><p>Other senders use tokens stored as SHA-256 hashes. Each token is read-only or write-only, can write only its own lane, and has a rate limit.</p></div>
+        <div class="def"><h3>SSO and team scoping</h3><p>People sign in with your identity provider (OIDC with PKCE). Groups map to teams that see only their envs and services. Tokens are stored as SHA-256 hashes and scoped the same way.</p></div>
         <div class="def"><h3>Hardened image</h3><p>Distroless, non-root, read-only root filesystem. Signed with cosign keyless, with an SBOM and SLSA provenance on every release.</p></div>
-        <div class="def"><h3>Built to run in production</h3><p>Health and readiness probes, Prometheus metrics, JSON logs, retention purge, a values schema and a helm test. One pod, one volume.</p></div>
+        <div class="def"><h3>Built to run in production</h3><p>Probes, Prometheus metrics, JSON logs, retention purge, a values schema and a helm test. One pod with SQLite, or several behind a PodDisruptionBudget with Postgres.</p></div>
       </div>
     </div>
   </section>
 
   <section class="s">
     <div class="wrap">
-      <div class="s-head"><p class="eyebrow">Roadmap</p><h2>What ships when.</h2></div>
+      <div class="s-head"><p class="eyebrow">Releases</p><h2>What has shipped.</h2><p class="lead">Next: a dependency map built from OpenTelemetry traces, per-cluster agents for multi-cluster setups, PagerDuty and Opsgenie incidents, and Microsoft Teams.</p></div>
       <div class="road">
-        <div class="phase now"><span class="tag">v0.1 · available now</span><h3>Timeline and ranking</h3><ul><li>Kubernetes, Helm, Argo CD, GitHub Actions, CloudTrail, Terraform</li><li>Change sets and ranked likely causes</li><li>Web UI, CLI, REST API, Grafana, Prometheus</li><li>Helm chart, signed image, Terraform module</li></ul></div>
-        <div class="phase"><span class="tag">v0.2</span><h3>Where on-call already is</h3><ul><li>Slack replies to alerts</li><li>MCP server for AI assistants</li><li>LaunchDarkly, Unleash, Flagsmith webhooks</li><li>Postgres for HA</li></ul></div>
-        <div class="phase"><span class="tag">v0.3</span><h3>Insights</h3><ul><li>Change failure rate (DORA)</li><li>Change freeze windows</li><li>OIDC SSO and per-team scoping in the UI</li></ul></div>
+        <div class="phase now"><span class="tag">v0.1 · shipped</span><h3>Timeline and ranking</h3><ul><li>Kubernetes, Helm, Argo CD, GitHub Actions, CloudTrail, Terraform</li><li>Change sets and ranked likely causes</li><li>Web UI, CLI, REST API, Grafana, Prometheus</li><li>Helm chart, signed image, Terraform module</li></ul></div>
+        <div class="phase now"><span class="tag">v0.2 · shipped</span><h3>Where on-call already is</h3><ul><li>Alertmanager opens incidents automatically</li><li>Slack posts and /changefeed</li><li>MCP server for AI assistants</li><li>LaunchDarkly, Unleash, Flagsmith webhooks</li><li>Postgres and several replicas</li></ul></div>
+        <div class="phase now"><span class="tag">v0.3 · available now</span><h3>Insights and control</h3><ul><li>Deploys per day and change failure rate</li><li>Change freeze windows with a CI gate</li><li>OIDC SSO and per-team scoping</li></ul></div>
       </div>
     </div>
   </section>

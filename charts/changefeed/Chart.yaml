@@ -2,8 +2,8 @@ apiVersion: v2
 name: changefeed
 description: One timeline of every production change (deploys, Argo CD, Kubernetes, Terraform, CloudTrail, feature flags) with ranked likely causes.
 type: application
-version: 0.1.0
-appVersion: "v0.1.0"
+version: 0.3.0
+appVersion: "v0.3.0"
 kubeVersion: ">=1.27.0-0"
 home: https://yousafkhamza.github.io/changefeed/
 icon: https://yousafkhamza.github.io/changefeed/icon.svg

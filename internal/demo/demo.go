@@ -9,6 +9,7 @@ import (
 
 	"github.com/yousafkhamza/changefeed/internal/config"
 	"github.com/yousafkhamza/changefeed/internal/event"
+	"github.com/yousafkhamza/changefeed/internal/store"
 )
 
 // Sink stores events (the server's Ingest).
@@ -56,6 +57,15 @@ func Config(cfg *config.Config) {
 	}
 	cfg.Services["checkout-api"] = config.Service{DependsOn: []string{"payments-api", "cart", "orders-db"}}
 	cfg.PlatformServices = append(cfg.PlatformServices, "platform", "ci-deployer")
+}
+
+// SeedIncidents records the sample alert, plus last month's history so the
+// delivery metrics page has something to show.
+func SeedIncidents(ctx context.Context, st *store.Store, now time.Time) error {
+	at := now.Add(-IncidentOffset).Truncate(time.Minute)
+	_, err := st.UpsertIncident(ctx, store.Incident{ID: "demo-incident", Service: "checkout-api", Env: "prod",
+		Title: "CheckoutHigh5xx: 5xx at 12%", Source: "alertmanager", StartedAt: at, TopChangeSet: "gh:shop/checkout#412", TopScore: 80})
+	return err
 }
 
 // Seed stores the sample events, timed so the alert fired IncidentOffset ago.

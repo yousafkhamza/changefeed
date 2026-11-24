@@ -6,6 +6,12 @@ branding:
   color: blue
 
 inputs:
+  mode:
+    description: "emit (record a change) or check-freeze (fail the job if a change freeze is active; run it before deploying)"
+    default: emit
+  override-reason:
+    description: Deploy during a freeze anyway. The reason is recorded on the event. Use for emergency fixes.
+    default: ""
   endpoint:
     description: changefeed server URL, e.g. https://changefeed.example.com
     required: true
@@ -47,6 +53,9 @@ inputs:
     default: "false"
 
 outputs:
+  frozen:
+    description: "check-freeze mode: true when a freeze is active"
+    value: ${{ steps.emit.outputs.frozen }}
   event-id:
     description: ID of the stored event
     value: ${{ steps.emit.outputs.event-id }}
@@ -73,6 +82,8 @@ runs:
         CF_AUDIENCE: ${{ inputs.audience }}
         CF_TOKEN: ${{ inputs.token }}
         CF_FAIL: ${{ inputs.fail-on-error }}
+        CF_MODE: ${{ inputs.mode }}
+        CF_OVERRIDE: ${{ inputs.override-reason }}
       run: |
         set -euo pipefail
         fail() {
@@ -89,6 +100,24 @@ runs:
         fi
         [ -n "$auth" ] || fail "no credentials: add 'permissions: id-token: write' to the job, or pass a token"
         echo "::add-mask::$auth"
+
+        # Freeze check: a policy gate, so an active freeze fails the job even
+        # when fail-on-error is false. Reaching changefeed follows fail-on-error.
+        if [ "$CF_MODE" = "check-freeze" ]; then
+          q=$(jq -rn --arg e "$CF_ENV" --arg s "$CF_SERVICE" '"env=\($e|@uri)&service=\($s|@uri)"')
+          fr=$(curl -sSf --max-time 15 --retry 3 --retry-all-errors -H "Authorization: Bearer $auth" \
+            "${CF_ENDPOINT%/}/api/v1/freeze?$q") || fail "could not check the change freeze at $CF_ENDPOINT"
+          if [ "$(jq -r .frozen <<<"$fr")" != "true" ]; then
+            echo "frozen=false" >> "$GITHUB_OUTPUT"; echo "changefeed: no change freeze for $CF_SERVICE in $CF_ENV"; exit 0
+          fi
+          echo "frozen=true" >> "$GITHUB_OUTPUT"
+          msg="change freeze '$(jq -r .name <<<"$fr")' is active until $(jq -r .until <<<"$fr"): $(jq -r '.reason // ""' <<<"$fr")"
+          if [ -n "$CF_OVERRIDE" ]; then
+            echo "::warning title=changefeed freeze override::$msg. Override reason: $CF_OVERRIDE"; exit 0
+          fi
+          echo "::error title=changefeed freeze::$msg. Set override-reason to deploy anyway."; exit 1
+        fi
+        [ "$CF_MODE" = "emit" ] || fail "mode must be emit or check-freeze"
 
         # 2. Summary and PR number from the triggering event.
         ev="${GITHUB_EVENT_PATH:-/dev/null}"
@@ -110,8 +139,11 @@ runs:
 
         body=$(jq -n --arg type "changefeed.$CF_KIND" --arg src "$CF_SOURCE" --arg svc "$CF_SERVICE" --arg env "$CF_ENV" \
           --arg sum "$summary" --arg risk "$CF_RISK" --arg rev "$CF_REVISION" --arg cs "$changeset" --argjson links "$links" \
+          --arg ovr "${CF_OVERRIDE:0:120}" \
           '{specversion:"1.0", type:$type, source:$src, subject:$svc,
-            data:({env:$env, summary:$sum, risk:$risk, revision:$rev, links:$links} + (if $cs == "" then {} else {changeset:$cs} end))}')
+            data:({env:$env, summary:$sum, risk:$risk, revision:$rev, links:$links}
+              + (if $cs == "" then {} else {changeset:$cs} end)
+              + (if $ovr == "" then {} else {labels:{"freeze-override":$ovr}} end))}')
 
         # 3. Send with retries. Network errors and 5xx are retried; 4xx are reported.
         resp=$(curl -sS --max-time 20 --retry 3 --retry-all-errors --retry-delay 2 -w '\n%{http_code}' \

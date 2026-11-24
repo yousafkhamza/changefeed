@@ -39,9 +39,9 @@ async function api(path) {
   const headers = { Accept: "application/json" };
   const t = token() || state.memToken;
   if (t) headers.Authorization = "Bearer " + t;
-  const res = await fetch(path, { headers, cache: "no-store" });
-  if (res.status === 401) { showLogin(); throw new Error("sign-in required"); }
+  const res = await fetch(path, { headers, cache: "no-store", credentials: "same-origin" });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401) { showLogin(!!body.sso); throw new Error("sign-in required"); }
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
 }
@@ -102,6 +102,7 @@ async function refresh() {
     state.suspects = sus ? sus.suspects : [];
     state.incident = sus ? sus.incident : null;
     render();
+    loadLower();
     setStatus(`${list.events.length} changes · updated ${hhmm(new Date())} UTC`);
   } catch (err) {
     setStatus(err.message);
@@ -238,6 +239,7 @@ async function renderDetail() {
       h("span", { class: "pill", vars: { "--c": kindVar(e.kind) } }, KIND_NAMES[e.kind] || e.kind),
       h("span", { class: `risk ${e.risk}` }, `${e.risk} risk`),
       e.outsideCI ? h("span", { class: "risk" }, "outside CI") : null,
+      e.labels && e.labels.freeze ? h("span", { class: "badge freeze", title: "Made during a change freeze" }, `freeze: ${e.labels.freeze}`) : null,
       rel !== null ? h("span", { class: "eyebrow" }, rel >= 0 ? `T-${rel}m before alert` : `${-rel}m after alert`) : null),
     h("p", { class: "d-title" }, e.summary),
     h("dl", { class: "kv" },
@@ -264,9 +266,72 @@ function select(id) {
 }
 
 // ---------- login ----------
-function showLogin() {
+function showLogin(sso) {
+  $("login-sso").hidden = !sso;
+  $("login-or").hidden = !sso;
   const d = $("login");
   if (!d.open) d.showModal();
+}
+
+function renderWho(who) {
+  const box = $("who");
+  const parts = [h("span", {}, who.name)];
+  if (who.envs && who.envs.length || who.services && who.services.length) {
+    parts.push(h("span", { class: "badge", title: `envs: ${(who.envs || ["all"]).join(", ")} · services: ${(who.services || ["all"]).join(", ")}` }, "team view"));
+  }
+  if (who.type === "sso") parts.push(h("a", { href: "auth/logout" }, "Sign out"));
+  box.replaceChildren(...parts);
+}
+
+async function loadLower() {
+  try {
+    const [inc, dora] = await Promise.all([
+      api("api/v1/incidents?" + new URLSearchParams({ env: state.env, since: "168h" })),
+      api("api/v1/dora?" + new URLSearchParams({ env: state.env })),
+    ]);
+    renderIncidents(inc.incidents);
+    renderDora(dora.services);
+  } catch { /* the main panel already shows the error */ }
+}
+
+function renderIncidents(list) {
+  const box = $("incidents");
+  if (!list.length) {
+    box.replaceChildren(h("p", { class: "empty" }, "No incidents in the last 7 days. Point an Alertmanager webhook receiver at /hooks/alertmanager to open them automatically."));
+    return;
+  }
+  box.replaceChildren(h("div", { class: "list" }, list.slice(0, 12).map((i) => {
+    const t = new Date(i.startedAt);
+    const open = !i.resolvedAt;
+    return h("button", { type: "button", class: "inc", title: "Investigate this incident", onclick: () => investigate(i.service, t) },
+      h("span", { class: "t" }, `${t.toISOString().slice(5, 10)} ${hhmm(t)}`),
+      h("span", {}, h("span", { class: "title" }, i.title), h("span", { class: "meta" }, `${i.service} · top cause ${i.topChangeset || "none found"}${i.topScore ? ` (${i.topScore})` : ""}`)),
+      h("span", { class: `badge${open ? " open" : ""}` }, open ? "open" : "resolved"));
+  })));
+}
+
+function renderDora(rows) {
+  const tbl = $("dora");
+  if (!rows.length) { tbl.replaceChildren(h("caption", { class: "empty" }, "No deployments recorded in the last 30 days.")); return; }
+  const head = h("tr", {}, ["Service", "Deploys / day", "Deployments", "Failed", "Change failure rate", "Incidents"].map((c) => h("th", { scope: "col" }, c)));
+  tbl.replaceChildren(h("thead", {}, head), h("tbody", {}, rows.map((r) => {
+    const fill = h("i"); fill.style.width = `${Math.round(r.changeFailureRate * 100)}%`;
+    return h("tr", {},
+      h("td", {}, r.service), h("td", {}, r.deploysPerDay.toFixed(2)), h("td", {}, String(r.deployments)),
+      h("td", {}, String(r.failedDeployments)),
+      h("td", {}, `${Math.round(r.changeFailureRate * 100)}%`, h("span", { class: "cfr-bar" }, fill)),
+      h("td", {}, String(r.incidents)));
+  })));
+}
+
+function investigate(service, at) {
+  state.service = service; state.at = at; state.tab = "sus";
+  $("i-service").value = service;
+  if (![...$("i-service").options].some((o) => o.value === service)) $("i-service").append(h("option", { value: service }, service));
+  $("i-service").value = service;
+  $("i-at").value = at.toISOString().slice(0, 16);
+  writeURL(); schedule(); refresh();
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 $("login-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -319,6 +384,7 @@ async function start() {
   try {
     const who = await api("api/v1/whoami");
     $("ver").textContent = `changefeed ${who.version}`;
+    renderWho(who);
     await loadMeta();
   } catch (err) {
     setStatus(err.message);

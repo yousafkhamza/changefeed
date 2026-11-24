@@ -12,3 +12,6 @@ terraform.tfstate*
 .DS_Store
 .idea/
 .vscode/
+
+# Private notes (interview prep); never published
+notes/

@@ -75,3 +75,17 @@ spec:
       ports:
         - port: http
 {{- end }}
+{{- if and .Values.postgres.enabled (gt (int .Values.postgres.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "changefeed.fullname" . }}
+  labels:
+    {{- include "changefeed.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "changefeed.selectorLabels" . | nindent 6 }}
+{{- end }}

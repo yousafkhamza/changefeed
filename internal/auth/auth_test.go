@@ -77,7 +77,7 @@ func claims(mutate ...func(map[string]any)) map[string]any {
 
 func verifier(f *fakeIssuer, repos ...string) *GitHubVerifier {
 	v := NewGitHubVerifier(issuer, "changefeed", repos, nil)
-	v.JWKSURL = f.srv.URL
+	v.SetJWKSURL(f.srv.URL)
 	v.Now = func() time.Time { return now }
 	return v
 }
@@ -145,7 +145,7 @@ func TestAuthenticateTokens(t *testing.T) {
 	if err != nil || !strings.HasPrefix(tok, "cf_") || len(hash) != 64 {
 		t.Fatalf("NewToken: %q %q %v", tok, hash, err)
 	}
-	a := New(config.Auth{Tokens: []config.Token{{Name: "argocd", SHA256: strings.ToUpper(hash), Scopes: []string{"write"}, Sources: []string{"argocd"}}}}, nil)
+	a := New(config.Auth{Tokens: []config.Token{{Name: "argocd", SHA256: strings.ToUpper(hash), Scopes: []string{"write"}, Sources: []string{"argocd"}}}}, nil, nil)
 
 	req := func(h string) *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -170,7 +170,7 @@ func TestAuthenticateTokens(t *testing.T) {
 	if _, err := a.Authenticate(req("Basic " + tok)); !errors.Is(err, ErrNoCredentials) {
 		t.Errorf("basic scheme must not be accepted: %v", err)
 	}
-	anon := New(config.Auth{AnonymousRead: true}, nil)
+	anon := New(config.Auth{AnonymousRead: true}, nil, nil)
 	p, err = anon.Authenticate(req(""))
 	if err != nil || !p.Can(ScopeRead) || p.Can(ScopeWrite) {
 		t.Errorf("anonymous read: %+v %v", p, err)
@@ -179,7 +179,7 @@ func TestAuthenticateTokens(t *testing.T) {
 
 func TestAuthenticateGitHub(t *testing.T) {
 	f := newIssuer(t)
-	a := New(config.Auth{}, verifier(f, "shop/checkout"))
+	a := New(config.Auth{}, verifier(f, "shop/checkout"), nil)
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	r.Header.Set("Authorization", "Bearer "+f.sign(t, "k1", claims()))
 	p, err := a.Authenticate(r)

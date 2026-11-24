@@ -15,12 +15,24 @@ serviceMonitor:
 networkPolicy:
   enabled: true
 config:
+  publicURL: https://changefeed.example.com
+  slack: { enabled: true, channel: "#incidents", minScore: 40 }
+  freezes:
+    - { name: weekend, envs: [prod], weekly: { from: "fri 16:00", to: "mon 08:00", timezone: Asia/Dubai } }
+    - { name: year-end, services: [payments-api], start: "2026-12-20T00:00:00Z", end: "2027-01-03T00:00:00Z" }
   auth:
+    oidc: { enabled: true, issuer: https://login.example.com, clientID: changefeed }
+    teams:
+      - { name: payments, groups: [payments-oncall], envs: [prod], services: [payments-api, checkout-api] }
     tokens:
       - name: argocd
         sha256: "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
         scopes: [write]
         sources: [argocd]
+      - name: payments-viewer
+        sha256: "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        scopes: [read]
+        services: [payments-api]
     github:
       enabled: true
       repositories: [shop/checkout, shop/*]
@@ -30,6 +42,7 @@ config:
       namespaces: [checkout, payments]
       watch: [deployments, statefulsets, configmaps, helm]
   hooks:
+    flags: { services: { fast-checkout: checkout-api }, envs: { production: prod } }
     aws:
       accounts:
         "111122223333": prod
@@ -37,3 +50,7 @@ config:
     checkout-api:
       dependsOn: [payments-api, cart, orders-db]
   platformServices: [platform]
+existingSecret: changefeed-secrets
+postgres:
+  enabled: true
+  replicaCount: 2

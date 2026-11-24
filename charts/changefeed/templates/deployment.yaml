@@ -4,11 +4,21 @@ metadata:
   name: {{ include "changefeed.fullname" . }}
   labels:
     {{- include "changefeed.labels" . | nindent 4 }}
+{{- if and .Values.postgres.enabled (not .Values.existingSecret) }}
+{{- fail "postgres.enabled needs existingSecret with a CHANGEFEED_DATABASE_URL key" }}
+{{- end }}
 spec:
+  {{- if .Values.postgres.enabled }}
+  replicas: {{ .Values.postgres.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  {{- else }}
   # One writer per SQLite volume. Recreate avoids two pods sharing the file.
   replicas: 1
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "changefeed.selectorLabels" . | nindent 6 }}
@@ -49,6 +59,11 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- with .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
@@ -80,7 +95,7 @@ spec:
           configMap:
             name: {{ include "changefeed.fullname" . }}
         - name: data
-          {{- if .Values.persistence.enabled }}
+          {{- if and .Values.persistence.enabled (not .Values.postgres.enabled) }}
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.existingClaim | default (include "changefeed.fullname" .) }}
           {{- else }}

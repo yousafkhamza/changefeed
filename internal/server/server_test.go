@@ -60,7 +60,7 @@ func newHarness(t *testing.T, mutate ...func(*config.Config)) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	hs.srv = New(cfg, st, auth.New(cfg.Auth, nil), slog.New(slog.NewTextHandler(io.Discard, nil)), prometheus.NewRegistry())
+	hs.srv = New(cfg, st, auth.New(cfg.Auth, nil, nil), slog.New(slog.NewTextHandler(io.Discard, nil)), prometheus.NewRegistry())
 	hs.srv.now = func() time.Time { return fixedNow }
 	hs.h = hs.srv.Handler()
 	return hs

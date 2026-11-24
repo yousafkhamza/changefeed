@@ -51,13 +51,14 @@ func serve(args []string, stderr io.Writer) error {
 	}
 	if *demoMode {
 		cfg.Storage.Path = ":memory:"
+		cfg.Secrets.DatabaseURL = ""
 		cfg.Auth.AnonymousRead = true
 		cfg.Collectors.Kubernetes.Enabled = false
 		demo.Config(&cfg)
 		log.Warn("demo mode: in-memory sample data, anyone who can reach this port can read it")
 	}
 
-	st, err := store.Open(cfg.Storage.Path)
+	st, err := store.Open(cfg.DSN())
 	if err != nil {
 		return err
 	}
@@ -67,13 +68,17 @@ func serve(args []string, stderr io.Writer) error {
 	if cfg.Auth.GitHub.Enabled {
 		gh = auth.NewGitHubVerifier(cfg.Auth.GitHub.Issuer, cfg.Auth.GitHub.Audience, cfg.Auth.GitHub.Repositories, cfg.Auth.GitHub.Environments)
 	}
-	if len(cfg.Auth.Tokens) == 0 && gh == nil && !cfg.Auth.AnonymousRead {
-		log.Warn("no tokens or GitHub OIDC configured: nobody can read or write; run `changefeed token` to create one")
+	var sso *auth.SSO
+	if cfg.Auth.OIDC.Enabled {
+		sso = auth.NewSSO(cfg.Auth.OIDC, cfg.Auth.Teams, cfg.Secrets.OIDCClientSecret, cfg.Secrets.SessionKey)
+	}
+	if len(cfg.Auth.Tokens) == 0 && gh == nil && sso == nil && !cfg.Auth.AnonymousRead {
+		log.Warn("no tokens, GitHub OIDC or SSO configured: nobody can read or write; run `changefeed token` to create one")
 	}
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	srv := server.New(cfg, st, auth.New(cfg.Auth, gh), log, reg)
+	srv := server.New(cfg, st, auth.New(cfg.Auth, gh, sso), log, reg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -82,7 +87,22 @@ func serve(args []string, stderr io.Writer) error {
 		if err := demo.Seed(ctx, srv, time.Now()); err != nil {
 			return err
 		}
+		if err := demo.SeedIncidents(ctx, st, time.Now()); err != nil {
+			return err
+		}
 	}
+	go func() {
+		tick := time.NewTicker(5 * time.Minute)
+		defer tick.Stop()
+		for {
+			srv.RefreshMetrics(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
 
 	errc := make(chan error, 2)
 	if cfg.Collectors.Kubernetes.Enabled {
@@ -120,7 +140,7 @@ func serve(args []string, stderr io.Writer) error {
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 	go func() {
-		log.Info("listening", "addr", cfg.Listen, "version", version.Version, "db", cfg.Storage.Path)
+		log.Info("listening", "addr", cfg.Listen, "version", version.Version, "storage", st.Backend(), "slack", cfg.Slack.Enabled, "sso", sso != nil)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}

@@ -31,6 +31,16 @@ auth:
     environments: []              # optionally only these GitHub environments
   rateLimit:
     perMinute: 600                # writes per token per minute
+  # Sign people in to the UI. Needs CHANGEFEED_SESSION_KEY (and CHANGEFEED_OIDC_CLIENT_SECRET
+  # for confidential clients). Register publicURL + /auth/callback with your identity provider.
+  oidc:
+    enabled: false
+    issuer: https://login.example.com
+    clientID: changefeed
+  # Teams scope what SSO users see; a team without envs/services sees everything.
+  teams:
+    - { name: payments, groups: [payments-oncall], envs: [prod], services: [payments-api, checkout-api] }
+    - { name: platform, groups: [platform] }
 
 collectors:
   kubernetes:
@@ -50,6 +60,15 @@ hooks:
     accounts:
       "111122223333": prod
       "444455556666": staging
+  alertmanager:                   # POST /hooks/alertmanager, token sources: [alertmanager]
+    serviceLabels: [service, app_kubernetes_io_name, app]
+    envLabels: [env, environment]
+    defaultEnv: prod
+    window: 60m
+  flags:                          # LaunchDarkly, Flagsmith, Unleash
+    services: { fast-checkout: checkout-api, new-nav: web }
+    defaultService: flags
+    envs: { production: prod, staging: staging }
 
 # Dependencies make ranking aware of what a service calls.
 services:
@@ -60,3 +79,25 @@ services:
 
 # Shared services that can affect everything.
 platformServices: [platform, network]
+
+# External URL, used in Slack links and the SSO redirect.
+publicURL: https://changefeed.example.com
+
+# Post the top likely causes when Alertmanager opens an incident.
+# Needs CHANGEFEED_SLACK_BOT_TOKEN (and CHANGEFEED_SLACK_SIGNING_SECRET for /changefeed).
+slack:
+  enabled: false
+  channel: "#incidents"
+  minScore: 40                    # hide weak matches
+
+# Change freezes; CI checks them with the action's mode: check-freeze.
+freezes:
+  - name: weekend
+    reason: No prod deploys at the weekend
+    envs: [prod]
+    weekly: { from: "fri 16:00", to: "mon 08:00", timezone: Asia/Dubai }
+  - name: year-end
+    reason: Peak trading
+    services: [payments-api]
+    start: "2026-12-20T00:00:00Z"
+    end: "2027-01-03T00:00:00Z"

@@ -1,0 +1,29 @@
+# Create the Slack app from this manifest: https://api.slack.com/apps → Create New App → From a manifest.
+# Replace changefeed.example.com with your changefeed publicURL, install the app, then put into
+# the changefeed Secret:
+#   CHANGEFEED_SLACK_BOT_TOKEN      = Bot User OAuth Token (xoxb-…)   from OAuth & Permissions
+#   CHANGEFEED_SLACK_SIGNING_SECRET = Signing Secret                   from Basic Information
+# Invite the bot to the incident channel: /invite @changefeed
+display_information:
+  name: changefeed
+  description: What changed before it broke?
+  background_color: "#0e1726"
+features:
+  bot_user:
+    display_name: changefeed
+    always_online: true
+  slash_commands:
+    - command: /changefeed
+      url: https://changefeed.example.com/hooks/slack/command
+      description: Likely causes for a service, or recent changes
+      usage_hint: "checkout-api 60m | since 2h cart"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

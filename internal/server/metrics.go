@@ -19,6 +19,11 @@ type Metrics struct {
 	duplicates prometheus.Counter
 	requests   *prometheus.CounterVec
 	latency    *prometheus.HistogramVec
+
+	incidents     *prometheus.CounterVec
+	slack         *prometheus.CounterVec
+	cfr           *prometheus.GaugeVec
+	deploysPerDay *prometheus.GaugeVec
 }
 
 func newMetrics(reg prometheus.Registerer) *Metrics {
@@ -42,13 +47,26 @@ func newMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "changefeed_http_request_duration_seconds", Help: "HTTP request latency by route.",
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5},
 		}, []string{"route"}),
+		incidents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "changefeed_incidents_opened_total", Help: "Incidents opened from Alertmanager alerts.",
+		}, []string{"env"}),
+		slack: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "changefeed_slack_posts_total", Help: "Slack incident posts by result (ok, error).",
+		}, []string{"result"}),
+		cfr: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "changefeed_change_failure_ratio", Help: "Share of deployments in the last 30 days that were the top-ranked cause of an incident.",
+		}, []string{"service", "env"}),
+		deploysPerDay: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "changefeed_deployments_per_day", Help: "Deployments (change sets with a deploy) per day over the last 30 days.",
+		}, []string{"service", "env"}),
 	}
 	if reg != nil {
 		build := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "changefeed_build_info", Help: "Build information.",
 		}, []string{"version", "commit"})
 		build.WithLabelValues(version.Version, version.Commit).Set(1)
-		reg.MustRegister(m.ingested, m.rejected, m.ignored, m.duplicates, m.requests, m.latency, build)
+		reg.MustRegister(m.ingested, m.rejected, m.ignored, m.duplicates, m.requests, m.latency, build,
+			m.incidents, m.slack, m.cfr, m.deploysPerDay)
 	}
 	return m
 }

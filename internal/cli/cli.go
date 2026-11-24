@@ -23,6 +23,7 @@ Usage:
   changefeed suspects --service NAME [flags]          rank likely causes of an incident
   changefeed token                                    create an API token and its config hash
   changefeed check-config FILE                        validate a server config without starting
+  changefeed mcp      [--endpoint URL]                MCP server on stdio for AI assistants (read-only)
   changefeed version
 
 Client commands read CHANGEFEED_ENDPOINT and CHANGEFEED_TOKEN from the environment.
@@ -50,6 +51,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		err = token(stdout)
 	case "check-config":
 		err = checkConfig(rest, stdout)
+	case "mcp":
+		err = mcpServe(rest, os.Stdin, stdout)
 	case "version", "--version", "-v":
 		fmt.Fprintf(stdout, "changefeed %s (commit %s, built %s)\n", version.Version, version.Commit, version.Date)
 	case "help", "-h", "--help":

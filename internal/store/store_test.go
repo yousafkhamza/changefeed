@@ -40,8 +40,7 @@ func mustInsert(t *testing.T, s *Store, e *event.Event) {
 	}
 }
 
-func TestInsertIsIdempotent(t *testing.T) {
-	s := open(t)
+func caseInsertIsIdempotent(t *testing.T, s *Store) {
 	mustInsert(t, s, ev("a", 1))
 	ok, err := s.Insert(context.Background(), ev("a", 1))
 	if err != nil || ok {
@@ -49,8 +48,7 @@ func TestInsertIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRoundTripKeepsAllFields(t *testing.T) {
-	s := open(t)
+func caseRoundTripKeepsAllFields(t *testing.T, s *Store) {
 	in := ev("a", 1, func(e *event.Event) {
 		e.Diff = []string{"- A: 1", "+ A: 2"}
 		e.Links = map[string]string{"pr": "https://github.com/shop/checkout/pull/412"}
@@ -71,8 +69,7 @@ func TestRoundTripKeepsAllFields(t *testing.T) {
 	}
 }
 
-func TestChangeSetLinking(t *testing.T) {
-	s := open(t)
+func caseChangeSetLinking(t *testing.T, s *Store) {
 	ctx := context.Background()
 	// A ConfigMap change and an image rollout arrive first, linked only by revision.
 	mustInsert(t, s, ev("cfg", 1, func(e *event.Event) { e.Source, e.Revision = "kubernetes", "9c2b7e1" }))
@@ -96,8 +93,7 @@ func TestChangeSetLinking(t *testing.T) {
 	}
 }
 
-func TestListFilters(t *testing.T) {
-	s := open(t)
+func caseListFilters(t *testing.T, s *Store) {
 	mustInsert(t, s, ev("a", 1))
 	mustInsert(t, s, ev("b", 2, func(e *event.Event) { e.Env = "staging" }))
 	mustInsert(t, s, ev("c", 3, func(e *event.Event) { e.Service, e.Kind = "cart", event.KindConfig }))
@@ -131,8 +127,7 @@ func TestListFilters(t *testing.T) {
 	check("limit", Filter{Limit: 1}, "d")
 }
 
-func TestPurge(t *testing.T) {
-	s := open(t)
+func casePurge(t *testing.T, s *Store) {
 	mustInsert(t, s, ev("old", 1))
 	mustInsert(t, s, ev("new", 60))
 	n, err := s.Purge(context.Background(), t0.Add(30*time.Minute))

@@ -10,9 +10,26 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# changefeed uses SQLite on a ReadWriteOnce volume, so it runs one replica
-# with the Recreate strategy. Change events are buffered by senders' retries
-# during the few seconds of a restart.
+# Secrets come from one existing Secret whose keys are the environment
+# variable names, for example:
+#   kubectl -n changefeed create secret generic changefeed-secrets \
+#     --from-literal=CHANGEFEED_DATABASE_URL='postgres://changefeed:…@pg:5432/changefeed?sslmode=require' \
+#     --from-literal=CHANGEFEED_SLACK_BOT_TOKEN=xoxb-… \
+#     --from-literal=CHANGEFEED_SLACK_SIGNING_SECRET=… \
+#     --from-literal=CHANGEFEED_SESSION_KEY="$(openssl rand -base64 48)"
+# Supported keys: CHANGEFEED_DATABASE_URL, CHANGEFEED_SLACK_BOT_TOKEN, CHANGEFEED_SLACK_SIGNING_SECRET,
+# CHANGEFEED_LAUNCHDARKLY_SECRET, CHANGEFEED_FLAGSMITH_SECRET, CHANGEFEED_OIDC_CLIENT_SECRET, CHANGEFEED_SESSION_KEY.
+existingSecret: ""
+
+# Postgres instead of SQLite. Put CHANGEFEED_DATABASE_URL in existingSecret.
+# Then changefeed runs several replicas with rolling updates and needs no volume.
+postgres:
+  enabled: false
+  replicaCount: 2
+
+# Without Postgres, changefeed uses SQLite on a ReadWriteOnce volume, so it
+# runs one replica with the Recreate strategy. Senders retry during the few
+# seconds of a restart.
 persistence:
   enabled: true
   size: 2Gi
@@ -25,6 +42,8 @@ persistence:
 # It holds no secrets: tokens are stored as SHA-256 hashes (`changefeed token`).
 config:
   listen: ":8080"
+  # External URL of the UI; used for Slack links and the SSO redirect.
+  publicURL: ""
   storage:
     path: /data/changefeed.db
     retention: 30d
@@ -44,6 +63,19 @@ config:
       environments: []
     rateLimit:
       perMinute: 600
+    # Sign in to the UI with your identity provider (Okta, Entra ID, Google, Keycloak…).
+    # Needs CHANGEFEED_SESSION_KEY (and usually CHANGEFEED_OIDC_CLIENT_SECRET) in existingSecret.
+    oidc:
+      enabled: false
+      issuer: ""          # https://login.example.com
+      clientID: ""
+      # redirectURL defaults to publicURL + /auth/callback
+    # Teams limit what SSO users see. Empty: every signed-in user sees everything.
+    teams: []
+    #  - name: payments
+    #    groups: [payments-oncall]
+    #    envs: [prod]
+    #    services: [payments-api, checkout-api]
   collectors:
     kubernetes:
       enabled: true
@@ -59,11 +91,36 @@ config:
     aws:
       defaultEnv: prod
       accounts: {}       # "111122223333": prod
+    alertmanager:
+      serviceLabels: [service, app_kubernetes_io_name, app, deployment, job]
+      envLabels: [env, environment]
+      defaultEnv: prod
+      window: 60m
+    flags:
+      services: {}       # flag key -> service, e.g. fast-checkout: checkout-api
+      defaultService: flags
+      envs: {}           # provider env -> env, e.g. production: prod
   # Dependencies used to rank likely causes.
   services: {}
   #  checkout-api:
   #    dependsOn: [payments-api, cart, orders-db]
   platformServices: []
+  # Post likely causes to Slack when Alertmanager opens an incident.
+  # Needs CHANGEFEED_SLACK_BOT_TOKEN (and CHANGEFEED_SLACK_SIGNING_SECRET for /changefeed).
+  slack:
+    enabled: false
+    channel: "#incidents"
+    minScore: 40
+  # Change freeze windows. CI checks them with the action's mode: check-freeze.
+  freezes: []
+  #  - name: weekend
+  #    reason: No prod deploys at the weekend
+  #    envs: [prod]
+  #    weekly: { from: "fri 16:00", to: "mon 08:00", timezone: Asia/Dubai }
+  #  - name: year-end
+  #    services: [payments-api]
+  #    start: "2026-12-20T00:00:00Z"
+  #    end: "2027-01-03T00:00:00Z"
 
 serviceAccount:
   create: true
