@@ -2,6 +2,8 @@ module github.com/yousafkhamza/changefeed
 
 go 1.26.0
 
+toolchain go1.27.4
+
 require (
 	github.com/prometheus/client_golang v1.25.0
 	k8s.io/api v0.37.2
