@@ -1,0 +1,55 @@
+# Sends Argo CD sync results to changefeed.
+#
+# 1. Create a token on the changefeed server limited to the argocd lane:
+#      changefeed token     # add the hash with scopes: [write], sources: [argocd]
+# 2. Store the token in argocd-notifications-secret:
+#      kubectl -n argocd patch secret argocd-notifications-secret \
+#        --type merge -p '{"stringData":{"changefeed-token":"<token>"}}'
+# 3. Merge the keys below into argocd-notifications-cm (do not replace other keys).
+# 4. Subscribe apps (or set it in the AppProject / default triggers):
+#      notifications.argoproj.io/subscribe.changefeed-on-sync-succeeded.changefeed: ""
+#      notifications.argoproj.io/subscribe.changefeed-on-sync-failed.changefeed: ""
+# Optional app labels: changefeed/service (defaults to app.kubernetes.io/name or the app name)
+#                      changefeed/env     (defaults to hooks.argocd.defaultEnv)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  service.webhook.changefeed: |
+    url: http://changefeed.changefeed.svc.cluster.local/hooks/argocd
+    headers:
+      - name: Authorization
+        value: Bearer $changefeed-token
+      - name: Content-Type
+        value: application/json
+
+  template.changefeed-sync: |
+    webhook:
+      changefeed:
+        method: POST
+        body: |
+          {
+            "app": {{ toJson .app.metadata.name }},
+            "project": {{ toJson .app.spec.project }},
+            "revision": {{ toJson .app.status.sync.revision }},
+            "phase": {{ toJson .app.status.operationState.phase }},
+            "message": {{ toJson .app.status.operationState.message }},
+            "health": {{ toJson .app.status.health.status }},
+            "destServer": {{ toJson .app.spec.destination.server }},
+            "destNamespace": {{ toJson .app.spec.destination.namespace }},
+            "repoURL": {{ toJson .app.spec.source.repoURL }},
+            "initiatedBy": {{ toJson .app.status.operationState.operation.initiatedBy.username }},
+            "automated": {{ toJson .app.status.operationState.operation.initiatedBy.automated }},
+            "finishedAt": {{ toJson .app.status.operationState.finishedAt }},
+            "url": "{{ .context.argocdUrl }}/applications/{{ .app.metadata.name }}",
+            "labels": {{ toJson .app.metadata.labels }}
+          }
+
+  trigger.changefeed-on-sync-succeeded: |
+    - when: app.status.operationState != nil and app.status.operationState.phase in ['Succeeded']
+      send: [changefeed-sync]
+  trigger.changefeed-on-sync-failed: |
+    - when: app.status.operationState != nil and app.status.operationState.phase in ['Error', 'Failed']
+      send: [changefeed-sync]

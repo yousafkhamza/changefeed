@@ -1,0 +1,126 @@
+name: changefeed emit
+description: Record a deploy or other change in changefeed. Authenticates with GitHub OIDC, so no secret is stored.
+author: Yousaf K Hamza
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  endpoint:
+    description: changefeed server URL, e.g. https://changefeed.example.com
+    required: true
+  service:
+    description: Service that changed, e.g. checkout-api
+    required: true
+  env:
+    description: Environment, e.g. prod
+    required: true
+  kind:
+    description: deploy, config, infra, flag, access or scale
+    default: deploy
+  summary:
+    description: One line describing the change. Default is the PR title or the first line of the commit message.
+    default: ""
+  risk:
+    description: low, medium or high
+    default: low
+  source:
+    description: Timeline lane (github, terraform, flags or helm)
+    default: github
+  revision:
+    description: Commit SHA that links this event to the Argo CD sync and rollout
+    default: ${{ github.sha }}
+  changeset:
+    description: Change set ID. Default is gh:<repo>#<PR number> when a PR can be found, otherwise the revision is used.
+    default: ""
+  links:
+    description: Extra links, one name=https://url per line
+    default: ""
+  audience:
+    description: OIDC audience; must match auth.github.audience on the server
+    default: changefeed
+  token:
+    description: Fallback bearer token for runners without OIDC (e.g. older GHES). Prefer OIDC.
+    default: ""
+  fail-on-error:
+    description: Fail the job if changefeed cannot be reached. Default false, so a changefeed outage never blocks a deploy.
+    default: "false"
+
+outputs:
+  event-id:
+    description: ID of the stored event
+    value: ${{ steps.emit.outputs.event-id }}
+  changeset:
+    description: Change set the event joined
+    value: ${{ steps.emit.outputs.changeset }}
+
+runs:
+  using: composite
+  steps:
+    - id: emit
+      shell: bash
+      env:
+        CF_ENDPOINT: ${{ inputs.endpoint }}
+        CF_SERVICE: ${{ inputs.service }}
+        CF_ENV: ${{ inputs.env }}
+        CF_KIND: ${{ inputs.kind }}
+        CF_SUMMARY: ${{ inputs.summary }}
+        CF_RISK: ${{ inputs.risk }}
+        CF_SOURCE: ${{ inputs.source }}
+        CF_REVISION: ${{ inputs.revision }}
+        CF_CHANGESET: ${{ inputs.changeset }}
+        CF_LINKS: ${{ inputs.links }}
+        CF_AUDIENCE: ${{ inputs.audience }}
+        CF_TOKEN: ${{ inputs.token }}
+        CF_FAIL: ${{ inputs.fail-on-error }}
+      run: |
+        set -euo pipefail
+        fail() {
+          if [ "$CF_FAIL" = "true" ]; then echo "::error title=changefeed::$1"; exit 1; fi
+          echo "::warning title=changefeed::$1 (deploy continues; set fail-on-error: true to block)"; exit 0
+        }
+        command -v jq >/dev/null || fail "jq is required on the runner"
+
+        # 1. Credentials: OIDC first, token as a fallback.
+        auth="$CF_TOKEN"
+        if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          auth=$(curl -sSf --max-time 15 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$(jq -rn --arg a "$CF_AUDIENCE" '$a|@uri')" | jq -r .value) || fail "could not get an OIDC token"
+        fi
+        [ -n "$auth" ] || fail "no credentials: add 'permissions: id-token: write' to the job, or pass a token"
+        echo "::add-mask::$auth"
+
+        # 2. Summary and PR number from the triggering event.
+        ev="${GITHUB_EVENT_PATH:-/dev/null}"
+        pr=$(jq -r '.pull_request.number // empty' "$ev" 2>/dev/null || true)
+        msg=$(jq -r '.pull_request.title // .head_commit.message // empty' "$ev" 2>/dev/null | head -n1 || true)
+        if [ -z "$pr" ]; then
+          pr=$(printf '%s' "$msg" | sed -nE 's/.*\(#([0-9]+)\)$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' | head -n1)
+        fi
+        summary="$CF_SUMMARY"
+        if [ -z "$summary" ]; then
+          if [ -n "$msg" ]; then summary="$msg"; else summary="Deploy ${CF_REVISION:0:7} by $GITHUB_ACTOR"; fi
+          [ -n "$pr" ] && [[ "$summary" != *"#$pr"* ]] && summary="PR #$pr: $summary"
+        fi
+        changeset="$CF_CHANGESET"
+        [ -z "$changeset" ] && [ -n "$pr" ] && changeset="gh:$GITHUB_REPOSITORY#$pr"
+
+        links=$(printf '%s\n' "$CF_LINKS" | jq -Rn '[inputs | select(test("^[^=]+=https?://")) | capture("^(?<k>[^=]+)=(?<v>.+)$") | {(.k): .v}] | add // {}')
+        [ -n "$pr" ] && links=$(jq --arg u "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$pr" '. + {pr: $u}' <<<"$links")
+
+        body=$(jq -n --arg type "changefeed.$CF_KIND" --arg src "$CF_SOURCE" --arg svc "$CF_SERVICE" --arg env "$CF_ENV" \
+          --arg sum "$summary" --arg risk "$CF_RISK" --arg rev "$CF_REVISION" --arg cs "$changeset" --argjson links "$links" \
+          '{specversion:"1.0", type:$type, source:$src, subject:$svc,
+            data:({env:$env, summary:$sum, risk:$risk, revision:$rev, links:$links} + (if $cs == "" then {} else {changeset:$cs} end))}')
+
+        # 3. Send with retries. Network errors and 5xx are retried; 4xx are reported.
+        resp=$(curl -sS --max-time 20 --retry 3 --retry-all-errors --retry-delay 2 -w '\n%{http_code}' \
+          -H "Authorization: Bearer $auth" -H "Content-Type: application/cloudevents+json" \
+          --data-binary "$body" "${CF_ENDPOINT%/}/api/v1/events") || fail "could not reach $CF_ENDPOINT"
+        code=$(tail -n1 <<<"$resp"); out=$(sed '$d' <<<"$resp")
+        [ "$code" = "202" ] || fail "server returned $code: $(jq -r '.error // .results[0].error // .' <<<"$out" 2>/dev/null)"
+        status=$(jq -r '.results[0].status' <<<"$out")
+        [ "$status" = "rejected" ] && fail "event rejected: $(jq -r '.results[0].error' <<<"$out")"
+        echo "event-id=$(jq -r '.results[0].id' <<<"$out")" >> "$GITHUB_OUTPUT"
+        echo "changeset=$(jq -r '.results[0].changeset // ""' <<<"$out")" >> "$GITHUB_OUTPUT"
+        echo "changefeed: $status $(jq -r '.results[0].id' <<<"$out") — $summary"

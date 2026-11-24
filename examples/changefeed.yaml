@@ -1,0 +1,62 @@
+# changefeed server configuration. Validate with: changefeed check-config changefeed.yaml
+# Unknown keys are rejected. Secrets never go here: tokens are stored as SHA-256 hashes.
+
+listen: ":8080"
+
+storage:
+  path: /data/changefeed.db
+  retention: 30d          # events older than this are purged hourly
+
+auth:
+  # Let anyone who can reach the server read events. Only behind an SSO proxy.
+  anonymousRead: false
+  # Create with `changefeed token`; only the hash is stored.
+  tokens:
+    - name: oncall-ui
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      scopes: [read]
+    - name: argocd
+      sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+      scopes: [write]
+      sources: [argocd]    # this token may only write the argocd lane
+    - name: aws-eventbridge
+      sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+      scopes: [write]
+      sources: [aws]
+  # GitHub Actions authenticate with OIDC; no secret is stored anywhere.
+  github:
+    enabled: true
+    audience: changefeed
+    repositories: [shop/*]        # owner/repo or owner/*
+    environments: []              # optionally only these GitHub environments
+  rateLimit:
+    perMinute: 600                # writes per token per minute
+
+collectors:
+  kubernetes:
+    enabled: true
+    env: prod
+    cluster: prod-eu-1
+    namespaces: []                # empty = all
+    ignoreNamespaces: [kube-system, kube-public, kube-node-lease]
+    watch: [deployments, statefulsets, daemonsets, configmaps, helm]
+    configMapValues: true         # show changed values (redacted); false = key names only
+
+hooks:
+  argocd:
+    defaultEnv: prod              # apps can override with the label changefeed/env
+  aws:
+    defaultEnv: prod
+    accounts:
+      "111122223333": prod
+      "444455556666": staging
+
+# Dependencies make ranking aware of what a service calls.
+services:
+  checkout-api:
+    dependsOn: [payments-api, cart, orders-db]
+  payments-api:
+    dependsOn: [orders-db]
+
+# Shared services that can affect everything.
+platformServices: [platform, network]

@@ -1,0 +1,39 @@
+# Exercises every optional template in CI.
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: changefeed.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: changefeed-tls
+      hosts: [changefeed.example.com]
+serviceMonitor:
+  enabled: true
+networkPolicy:
+  enabled: true
+config:
+  auth:
+    tokens:
+      - name: argocd
+        sha256: "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        scopes: [write]
+        sources: [argocd]
+    github:
+      enabled: true
+      repositories: [shop/checkout, shop/*]
+  collectors:
+    kubernetes:
+      cluster: prod-eu-1
+      namespaces: [checkout, payments]
+      watch: [deployments, statefulsets, configmaps, helm]
+  hooks:
+    aws:
+      accounts:
+        "111122223333": prod
+  services:
+    checkout-api:
+      dependsOn: [payments-api, cart, orders-db]
+  platformServices: [platform]

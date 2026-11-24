@@ -1,0 +1,180 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go (test, lint, vuln)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: go mod verify
+        run: go mod verify
+      - name: test (race, coverage)
+        run: go test -race -shuffle=on -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - name: coverage summary
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')
+          echo "### Test coverage: $total" >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | sort -k3 -n | head -15 | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+      - name: build all platforms
+        run: |
+          for p in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+            GOOS=${p%/*} GOARCH=${p#*/} CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/changefeed
+          done
+
+  chart:
+    name: helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: lint
+        run: |
+          helm lint charts/changefeed --strict
+          helm lint charts/changefeed --strict -f test/chart/full-values.yaml
+      - name: render and validate against Kubernetes schemas
+        run: |
+          for v in charts/changefeed/values.yaml test/chart/full-values.yaml; do
+            helm template cf charts/changefeed -n changefeed -f "$v" > rendered.yaml
+            go run github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0 -strict -summary \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              rendered.yaml
+          done
+      - name: rendered config is accepted by the server
+        run: |
+          for v in charts/changefeed/values.yaml test/chart/full-values.yaml; do
+            helm template cf charts/changefeed -f "$v" --show-only templates/configmap.yaml \
+              | yq '.data["changefeed.yaml"]' > rendered-config.yaml
+            go run ./cmd/changefeed check-config rendered-config.yaml
+          done
+
+  terraform:
+    name: terraform module
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: deploy/terraform/aws-cloudtrail
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      - run: terraform fmt -check -diff
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  workflows:
+    name: workflows and action
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: actionlint (includes shellcheck of run steps)
+        run: |
+          sudo apt-get install -y --no-install-recommends shellcheck >/dev/null
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: shellcheck the composite action script
+        run: |
+          yq '.runs.steps[0].run' action.yml > /tmp/action.sh
+          shellcheck --shell=bash /tmp/action.sh
+
+  e2e:
+    name: end to end (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [go, chart]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: changefeed:e2e
+          build-args: VERSION=e2e
+      - name: image smoke test (demo mode)
+        run: |
+          docker run -d --name cf -p 8080:8080 changefeed:e2e serve --demo --log-format text
+          for _ in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
+          curl -sf 'localhost:8080/api/v1/suspects?service=checkout-api&window=60m&at=8m' | tee suspects.json | jq -e '.suspects[0].changeset == "gh:shop/checkout#412"'
+          docker rm -f cf
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: cf
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: install chart with the local image
+        run: |
+          kind load docker-image changefeed:e2e --name cf
+          kubectl create namespace shop
+          kubectl -n shop create deployment checkout-api --image=nginx:1.27-alpine --replicas=1
+          kubectl -n shop rollout status deploy/checkout-api --timeout=120s
+          helm install cf charts/changefeed -n changefeed --create-namespace --wait --timeout 3m \
+            --set image.repository=changefeed --set image.tag=e2e --set image.pullPolicy=Never \
+            --set config.auth.anonymousRead=true --set config.collectors.kubernetes.cluster=kind \
+            --set 'config.collectors.kubernetes.namespaces={shop}'
+          helm test cf -n changefeed
+      - name: a rollout and a ConfigMap edit appear in the timeline
+        run: |
+          kubectl -n changefeed port-forward svc/cf-changefeed 8080:80 >/dev/null 2>&1 &
+          sleep 3
+          kubectl -n shop create configmap checkout-config --from-literal=PAYMENT_TIMEOUT_MS=3000
+          kubectl -n shop label configmap checkout-config app=checkout-api
+          kubectl -n shop patch configmap checkout-config --type merge -p '{"data":{"PAYMENT_TIMEOUT_MS":"800"}}'
+          kubectl -n shop set image deploy/checkout-api nginx=nginx:1.27.5-alpine
+          for _ in $(seq 1 30); do
+            curl -sf 'localhost:8080/api/v1/events?since=10m&service=checkout-api' > events.json || true
+            if jq -e '[.events[].kind] | any(.[]; . == "deploy") and any(.[]; . == "config")' events.json >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          jq '.events[] | {time, source, kind, summary, diff}' events.json
+          jq -e '[.events[] | select(.kind == "deploy") | .summary] | any(.[]; test("Rollout checkout-api"))' events.json
+          jq -e '[.events[] | select(.kind == "config") | (.diff // [])[]] | any(.[]; . == "+ PAYMENT_TIMEOUT_MS: 800")' events.json
+      - name: logs on failure
+        if: failure()
+        run: kubectl -n changefeed logs deploy/cf-changefeed --tail=200 || true

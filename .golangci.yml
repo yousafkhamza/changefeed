@@ -1,0 +1,42 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gosec
+    - misspell
+    - nolintlint
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    gosec:
+      excludes:
+        - G304 # file paths come from the operator (--config, --from-plan), not from requests
+    revive:
+      rules:
+        - name: exported
+        - name: var-naming
+        - name: unused-parameter
+          disabled: true
+    misspell:
+      locale: US
+  exclusions:
+    presets: [std-error-handling, common-false-positives]
+    rules:
+      - path: _test\.go
+        linters: [errcheck, gosec, noctx, bodyclose, unparam, usestdlibvars]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/yousafkhamza/changefeed]

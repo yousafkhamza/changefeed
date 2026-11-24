@@ -1,0 +1,56 @@
+{{- $k := .Values.config.collectors.kubernetes }}
+{{- if and .Values.rbac.create $k.enabled }}
+{{- $rules := include "changefeed.rules" . }}
+{{- if not $k.namespaces }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "changefeed.fullname" . }}
+  labels:
+    {{- include "changefeed.labels" . | nindent 4 }}
+rules:{{ $rules }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "changefeed.fullname" . }}
+  labels:
+    {{- include "changefeed.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "changefeed.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "changefeed.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range $ns := $k.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "changefeed.fullname" $ }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "changefeed.labels" $ | nindent 4 }}
+rules:{{ $rules }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "changefeed.fullname" $ }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "changefeed.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "changefeed.fullname" $ }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "changefeed.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

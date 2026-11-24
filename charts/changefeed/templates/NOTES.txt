@@ -1,0 +1,18 @@
+changefeed {{ .Values.image.tag | default .Chart.AppVersion }} is installed in {{ .Release.Namespace }}.
+
+Open the timeline:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "changefeed.fullname" . }} 8080:{{ .Values.service.port }}
+  open http://localhost:8080
+{{- if and (not .Values.config.auth.tokens) (not .Values.config.auth.github.enabled) (not .Values.config.auth.anonymousRead) }}
+
+WARNING: no credentials are configured, so nobody can read or send events yet.
+Create a token and add its hash under config.auth.tokens:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "changefeed.fullname" . }} -- /changefeed token
+{{- end }}
+
+Send a test event:
+  CHANGEFEED_ENDPOINT=http://localhost:8080 CHANGEFEED_TOKEN=<token> \
+    changefeed emit --service my-app --env {{ .Values.config.collectors.kubernetes.env }} --kind config "Hello from changefeed"
+
+Integrations (Argo CD, GitHub Actions, AWS CloudTrail, Terraform):
+  https://yousafkhamza.github.io/changefeed/#integrate

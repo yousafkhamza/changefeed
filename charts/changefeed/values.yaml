@@ -1,0 +1,135 @@
+# Default values for changefeed. Every key is documented; see values.schema.json for types.
+
+image:
+  repository: ghcr.io/yousafkhamza/changefeed
+  # Defaults to the chart appVersion. Pin a digest in production: tag: v0.1.0@sha256:...
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# changefeed uses SQLite on a ReadWriteOnce volume, so it runs one replica
+# with the Recreate strategy. Change events are buffered by senders' retries
+# during the few seconds of a restart.
+persistence:
+  enabled: true
+  size: 2Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  # Use an existing PVC instead of creating one.
+  existingClaim: ""
+
+# Server configuration, rendered to /etc/changefeed/changefeed.yaml.
+# It holds no secrets: tokens are stored as SHA-256 hashes (`changefeed token`).
+config:
+  listen: ":8080"
+  storage:
+    path: /data/changefeed.db
+    retention: 30d
+  auth:
+    # Let anyone who can reach the service read events. Only enable this
+    # behind an SSO proxy (oauth2-proxy, an authenticating ingress).
+    anonymousRead: false
+    tokens: []
+    #  - name: argocd
+    #    sha256: "<64 hex chars>"
+    #    scopes: [write]
+    #    sources: [argocd]
+    github:
+      enabled: false
+      audience: changefeed
+      repositories: []   # owner/repo or owner/*
+      environments: []
+    rateLimit:
+      perMinute: 600
+  collectors:
+    kubernetes:
+      enabled: true
+      env: prod
+      cluster: ""        # shown in event origin, e.g. prod-eu-1
+      namespaces: []     # empty = all namespaces (ClusterRole); listed = Role per namespace
+      ignoreNamespaces: [kube-system, kube-public, kube-node-lease]
+      watch: [deployments, statefulsets, daemonsets, configmaps]  # add "helm" to record Helm releases
+      configMapValues: true
+  hooks:
+    argocd:
+      defaultEnv: prod
+    aws:
+      defaultEnv: prod
+      accounts: {}       # "111122223333": prod
+  # Dependencies used to rank likely causes.
+  services: {}
+  #  checkout-api:
+  #    dependsOn: [payments-api, cart, orders-db]
+  platformServices: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: changefeed.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Creates a Prometheus Operator ServiceMonitor for /metrics.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+# Restricts ingress to the namespaces that send events or read the UI.
+networkPolicy:
+  enabled: false
+  # Extra allowed sources, e.g. the ingress controller namespace.
+  from: []
+  #  - namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: ingress-nginx
+
+logFormat: json
+extraEnv: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""

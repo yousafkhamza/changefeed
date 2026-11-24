@@ -1,0 +1,9 @@
+.git
+.github
+docs
+charts
+deploy
+dist
+*.db
+*.db-*
+coverage.out

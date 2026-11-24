@@ -1,0 +1,14 @@
+/bin/
+/dist/
+*.db
+*.db-shm
+*.db-wal
+coverage.out
+rendered*.yaml
+*.tgz
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+.DS_Store
+.idea/
+.vscode/
