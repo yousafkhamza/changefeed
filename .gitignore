@@ -14,4 +14,4 @@ terraform.tfstate*
 .vscode/
 
 # Private notes (interview prep); never published
-notes/
+# notes/
